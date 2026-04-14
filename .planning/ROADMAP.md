@@ -50,7 +50,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] 02-02-orchestrator-server-PLAN.md — orchestrator.py FastAPI app: /ws multiplexed by role, in-memory registry, broadcast, GET /api/stations (ORC-01..04)
 - [x] 02-03-station-ws-client-PLAN.md — ws_client.py background-thread client with 1→8s reconnect backoff; wire into run_station via status_listener (ORC-01, ORC-02, ORC-04)
 - [x] 02-04-dashboard-ui-PLAN.md — templates/dashboard.html + static/dashboard.js + static/dashboard.css + GET / in orchestrator (DSH-01, DSH-02)
-- [ ] 02-05-integration-tests-PLAN.md — end-to-end tests proving the 4 ROADMAP success criteria (ORC-03, ORC-04)
+- [x] 02-05-integration-tests-PLAN.md — end-to-end tests proving the 4 ROADMAP success criteria (ORC-03, ORC-04)
 **UI hint**: yes
 
 ### Phase 3: Error Handling + Demo Prep

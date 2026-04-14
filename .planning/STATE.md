@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 02-04-dashboard-ui-PLAN.md
-last_updated: "2026-04-14T15:52:32.771Z"
+status: verifying
+stopped_at: Completed 02-05-integration-tests-PLAN.md
+last_updated: "2026-04-14T15:55:51.751Z"
 last_activity: 2026-04-14
 progress:
   total_phases: 3
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 11
-  completed_plans: 10
-  percent: 91
+  completed_plans: 11
+  percent: 100
 ---
 
 # Project State
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-04-13)
 
 Phase: 2 (Orchestrator + Dashboard) — EXECUTING
 Plan: 5 of 5
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-04-14
 
 Progress: [░░░░░░░░░░] 0%
@@ -56,6 +56,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 02-orchestrator-dashboard P02 | 180 | 1 tasks | 2 files |
 | Phase 02-orchestrator-dashboard P03 | 15 | 1 tasks | 3 files |
 | Phase 02-orchestrator-dashboard P04 | 15 | 2 tasks | 5 files |
+| Phase 02-orchestrator-dashboard P05 | 10 | 1 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -77,6 +78,7 @@ Recent decisions affecting current work:
 - [Phase 02-04]: Plain CSS grid auto-fit minmax(260px,1fr) for responsive 1-4 column layout with zero build step
 - [Phase 02-04]: ES5-compatible vanilla JS IIFE for broadest demo-day browser compatibility
 - [Phase 02-04]: TemplateResponse(request, name) positional API to avoid Starlette deprecation
+- [Phase 02-orchestrator-dashboard]: Added registry.reset() in client fixture for test isolation; used _Cfg helper to avoid importing Config for standalone tests; orchestrator-down test uses port 1 (always refused)
 
 ### Pending Todos
 
@@ -90,6 +92,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-14T15:52:32.769Z
-Stopped at: Completed 02-04-dashboard-ui-PLAN.md
+Last session: 2026-04-14T15:55:51.749Z
+Stopped at: Completed 02-05-integration-tests-PLAN.md
 Resume file: None
