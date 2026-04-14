@@ -17,6 +17,7 @@ from typing import Callable, Optional
 import logging
 import signal
 import sys
+import threading
 import time
 
 import cv2
@@ -63,6 +64,7 @@ class Station:
         self.state = StationState(station_id=getattr(config, "station_id", "station-1"))
         self._cycle_lock = False        # D-10 / ROB-04: local cycle lock
         self._stop = False
+        self._halted = False           # D-04: permanent halt flag (ERR-02/03)
         # D-17: one-time startup warning when enabled but no targets calibrated
         if config.vision_confirm_enabled:
             targets = config.robot_vision_targets or {}
@@ -103,12 +105,38 @@ class Station:
             except Exception as e:
                 log.warning("status_listener raised: %s", e)
 
+    def _halt(self, reason: str) -> None:
+        """Mark station permanently halted. Called from watchdog timer thread or robot-exception handler.
+        Thread-safe: GIL protects bool assignment and _set_status (D-03, D-07).
+        Process restart required to resume cycles."""
+        self._cycle_lock = False     # release lock so callers waiting on it don't deadlock
+        self._halted = True
+        self._set_status("error")
+        log.error("Station %s halted: %s", self.state.station_id, reason)
+
+    def _watchdog_fire(self, cls: str, dest_bin, cycle_start: float) -> None:
+        """Called by threading.Timer when a cycle exceeds cycle_watchdog_timeout_s.
+        Writes the JSONL error entry, then halts. (D-01, D-03)"""
+        elapsed_ms = int((time.monotonic() - cycle_start) * 1000)
+        try:
+            self.log.write(cls, dest_bin, elapsed_ms, "error", error="watchdog_timeout")
+        except Exception:
+            pass   # do not mask the halt
+        self._halt("watchdog_timeout")
+
     def _run_cycle(self, frame: np.ndarray, detection: Detection) -> LogEntry:
         """Execute one detection-to-home cycle. Writes exactly one log entry.
         Cycle lock owner: try/finally releases lock on any exit (PITFALLS #8)."""
         self._cycle_lock = True
         cycle_start = time.monotonic()
         self._set_status("processing")
+        _watchdog = threading.Timer(
+            self.config.cycle_watchdog_timeout_s,
+            self._watchdog_fire,
+            args=["unknown", None, cycle_start],
+        )
+        _watchdog.daemon = True
+        _watchdog.start()
         try:
             # PITFALLS #3: settle delay before QR decode
             settle_ms = getattr(self.config, "qr_settle_delay_ms", 150)
@@ -124,6 +152,7 @@ class Station:
                 self._set_status("unknown_package")
                 entry = self.log.write("unknown", None, elapsed_ms, "unknown_package",
                                        error="yolo_hit_but_qr_fail")
+                self._set_status("free")
                 return entry
 
             if class_letter not in self.config.class_to_bin:
@@ -131,6 +160,7 @@ class Station:
                 self._set_status("unknown_package")
                 entry = self.log.write("unknown", None, elapsed_ms, "unknown_package",
                                        error=f"class_not_mapped:{class_letter}")
+                self._set_status("free")
                 return entry
 
             dest_bin = self.config.class_to_bin[class_letter]
@@ -150,8 +180,8 @@ class Station:
                     vc_home = (None, None, None)
             except Exception as e:
                 elapsed_ms = int((time.monotonic() - cycle_start) * 1000)
-                self._set_status("error")
                 log.exception("Robot cycle failed")
+                self._halt(f"robot_exception:{type(e).__name__}")
                 return self.log.write(class_letter, dest_bin, elapsed_ms, "error", error=str(e))
 
             elapsed_ms = int((time.monotonic() - cycle_start) * 1000)
@@ -168,6 +198,7 @@ class Station:
             )
             return entry
         finally:
+            _watchdog.cancel()
             self._cycle_lock = False   # PITFALLS #8: always release
 
     def run_once(self, frame: np.ndarray):
@@ -175,6 +206,8 @@ class Station:
         Returns (state, None) if no detection or already locked."""
         if self._cycle_lock:
             return (self.state, None)   # ROB-04: ignore detections mid-cycle
+        if self._halted:
+            return (self.state, None)   # D-04: permanent halt — frames consumed, cycles suppressed
         detection = self.vision.detect(frame)
         if detection is None:
             return (self.state, None)
