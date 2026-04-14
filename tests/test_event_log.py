@@ -70,3 +70,38 @@ def test_timestamp_iso8601(tmp_path):
     # ISO-8601 parse must succeed
     from datetime import datetime as dt
     dt.fromisoformat(entry["timestamp"])
+
+
+# ---------------------------------------------------------------------------
+# Phase 02.1 — vision-confirm optional fields (D-18)
+# ---------------------------------------------------------------------------
+
+def test_write_without_vision_kwargs_produces_phase1_schema(tmp_path):
+    """Calling write with no vision kwargs → JSONL key-set is exactly Phase 1 D-16 schema."""
+    with EventLogger(tmp_path) as el:
+        el.write("A", 1, 4500, "completed", None)
+    line = next(tmp_path.glob("session-*.log")).read_text().strip()
+    entry = json.loads(line)
+    assert set(entry.keys()) == {"timestamp", "class", "destination_bin", "cycle_time_ms", "status", "error"}
+
+
+def test_write_with_vision_kwargs_includes_vision_fields(tmp_path):
+    """write(..., vision_confirmed=True, drift_px=12, vision_reason='ok') → three new fields present."""
+    with EventLogger(tmp_path) as el:
+        el.write("B", 2, 5000, "completed", None,
+                 vision_confirmed=True, drift_px=12, vision_reason="ok")
+    entry = json.loads(next(tmp_path.glob("session-*.log")).read_text().strip())
+    assert entry["vision_confirmed"] is True
+    assert entry["drift_px"] == 12
+    assert entry["vision_reason"] == "ok"
+
+
+def test_write_vision_drift_none_serializes_as_json_null(tmp_path):
+    """write(..., vision_confirmed=False, drift_px=None, ...) → drift_px is JSON null."""
+    with EventLogger(tmp_path) as el:
+        el.write("C", 3, 3000, "completed", None,
+                 vision_confirmed=False, drift_px=None, vision_reason="robot_qr_not_found")
+    entry = json.loads(next(tmp_path.glob("session-*.log")).read_text().strip())
+    assert entry["vision_confirmed"] is False
+    assert entry["drift_px"] is None
+    assert entry["vision_reason"] == "robot_qr_not_found"
