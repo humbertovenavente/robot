@@ -19,3 +19,7 @@ bin_encoder_targets:          # degrees per bin; calibration writes these
 motor_speed_deg_per_sec: 180
 cycle_watchdog_timeout_s: 30
 log_dir: logs
+
+# Phase 2 orchestrator endpoint (D-05). Leave commented/empty to run standalone (D-06, ORC-04).
+# Format: ws://<host>:<port>/ws  (no role query — ws_client adds ?role=station)
+# orchestrator_url: ws://127.0.0.1:8000/ws

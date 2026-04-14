@@ -12,7 +12,7 @@ Config is read-only once loaded. Reload by calling load_config() again.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Literal
+from typing import Dict, Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field
@@ -34,12 +34,18 @@ class Config(BaseModel):
     qr_retry_count: int = Field(ge=1, default=3)
     qr_settle_delay_ms: int = 500
     robot_implementation: Literal["stub", "ev3", "spike"] = "stub"
+    orchestrator_url: Optional[str] = None  # D-05: ws://host:port/ws; None=standalone (D-06)
     class_to_bin: Dict[str, int]
     home_encoder_target: int = 0
     bin_encoder_targets: Dict[int, int]
     motor_speed_deg_per_sec: int = 180
     cycle_watchdog_timeout_s: int = 30
     log_dir: str = "logs"
+
+    @property
+    def orchestrator_enabled(self) -> bool:
+        """True iff orchestrator_url is non-empty. D-06: empty/None = standalone mode."""
+        return bool(self.orchestrator_url and self.orchestrator_url.strip())
 
     @property
     def resolved_model_path(self) -> Path:
