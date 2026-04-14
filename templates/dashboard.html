@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LEGO Package Sorter — Live</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>LEGO Package Sorter</h1>
+    <div id="conn-banner" class="banner hidden">Disconnected — reconnecting…</div>
+  </header>
+  <main>
+    <section id="cards" class="grid" aria-live="polite">
+      <!-- station cards injected by dashboard.js -->
+    </section>
+    <p id="empty-state" class="empty">Waiting for stations…</p>
+  </main>
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>

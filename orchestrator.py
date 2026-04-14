@@ -11,8 +11,12 @@ import logging
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Optional, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from pathlib import Path
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Request
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 from ws_protocol import (
     RegisterMsg, StatusMsg, StationUpdateMsg,
@@ -22,6 +26,15 @@ from ws_protocol import (
 log = logging.getLogger("orchestrator")
 
 app = FastAPI(title="LEGO Package Sorter Orchestrator")
+
+REPO_ROOT = Path(__file__).resolve().parent
+_templates = Jinja2Templates(directory=str(REPO_ROOT / "templates"))
+app.mount("/static", StaticFiles(directory=str(REPO_ROOT / "static")), name="static")
+
+
+@app.get("/")
+async def dashboard_index(request: Request):
+    return _templates.TemplateResponse("dashboard.html", {"request": request})
 
 
 @dataclass

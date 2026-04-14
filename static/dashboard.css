@@ -1,0 +1,21 @@
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #0f172a; color: #f1f5f9; }
+.topbar { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; background: #1e293b; border-bottom: 1px solid #334155; }
+.topbar h1 { margin: 0; font-size: 20px; font-weight: 600; }
+.banner { background: #b45309; color: #fff; padding: 8px 16px; border-radius: 6px; font-size: 14px; }
+.banner.hidden { display: none; }
+main { padding: 24px; }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.card { position: relative; background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; min-height: 140px; transition: transform 0.15s; }
+.card h2 { margin: 0 0 12px 0; font-size: 16px; font-weight: 600; }
+.badge { display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+.badge.free { background: #22c55e; color: #052e16; }
+.badge.processing { background: #3b82f6; color: #0c1e42; }
+.badge.unknown_package { background: #eab308; color: #3a2a05; }
+.badge.error { background: #ef4444; color: #3b0a0a; }
+.event-line { margin-top: 12px; color: #cbd5e1; font-size: 14px; font-variant-numeric: tabular-nums; }
+.event-line .muted { color: #64748b; }
+.offline-overlay { position: absolute; inset: 0; background: rgba(15, 23, 42, 0.75); border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 16px; font-weight: 600; color: #f87171; }
+.card.online .offline-overlay { display: none; }
+.empty { color: #94a3b8; text-align: center; padding: 32px; }
+.empty.hidden { display: none; }
