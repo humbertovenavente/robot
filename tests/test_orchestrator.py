@@ -9,6 +9,8 @@ from ws_protocol import encode, RegisterMsg, StatusMsg
 
 @pytest.fixture
 def client():
+    import orchestrator
+    orchestrator.registry.reset()
     with TestClient(app) as c:
         yield c
 
