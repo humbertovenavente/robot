@@ -22,12 +22,13 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 
 from config import load_config, REPO_ROOT
 from robot import build_robot, RobotInterface
+from vision_confirm import find_robot_qr
 
 
 def _prompt(msg: str) -> None:
@@ -39,11 +40,71 @@ def _prompt(msg: str) -> None:
         raise SystemExit(130)
 
 
+def capture_pixel_target(
+    cap,
+    target_name: str,
+    max_retries: int = 3,
+) -> Optional[Tuple[int, int]]:
+    """Grab a frame, run find_robot_qr. On None, prompt operator to retry
+    (up to max_retries) or skip. Return the center or None if skipped.
+
+    D-10: null-on-skip is valid; runtime will no-op that target (D-17).
+    """
+    attempts = 0
+    while attempts < max_retries:
+        ret, frame = cap.read()
+        if not ret:
+            print(f"  WARNING: could not read frame for {target_name}; skipping pixel capture.")
+            return None
+        center = find_robot_qr(frame)
+        if center is not None:
+            print(f"  pixel target for {target_name}: {center}")
+            return center
+        # QR not found — ask operator
+        attempts += 1
+        if attempts >= max_retries:
+            print(f"  ROBOT QR not found at {target_name} after {max_retries} attempt(s). Skipping.")
+            return None
+        try:
+            choice = input(
+                f"  ROBOT QR not found at {target_name}. [r]etry / [s]kip: "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.", file=sys.stderr)
+            raise SystemExit(130)
+        if choice.startswith("s"):
+            return None
+        # Any other input (including "r") → retry
+    return None
+
+
+def write_pixel_target_to_yaml(
+    yaml_path: str,
+    target_name: str,
+    center: Optional[Tuple[int, int]],
+) -> None:
+    """Read yaml with safe_load, set robot_vision_targets[target_name] = list(center) or None,
+    write back with safe_dump preserving all other keys.
+
+    D-11: pixel targets live under robot_vision_targets in station_config.yaml.
+    """
+    with open(yaml_path, "r") as f:
+        data = yaml.safe_load(f) or {}
+    targets = data.setdefault(
+        "robot_vision_targets",
+        {"home": None, "bin_1": None, "bin_2": None, "bin_3": None},
+    )
+    targets[target_name] = list(center) if center is not None else None
+    with open(yaml_path, "w") as f:
+        yaml.safe_dump(data, f, sort_keys=False, default_flow_style=None)
+
+
 def run_calibration(
     config_path: Path,
     dry_run: bool = False,
     non_interactive: bool = False,
     stub_preset: Optional[Dict[int, int]] = None,
+    cap=None,
 ) -> dict:
     """Execute calibration and optionally write updated YAML.
 
@@ -55,12 +116,21 @@ def run_calibration(
         non_interactive: If True, skips interactive prompts (for CI / --yes mode).
         stub_preset: Optional dict mapping position key (0=home, 1..N=bins) to encoder value.
             When provided, values are used directly instead of querying the robot.
+        cap: Optional cv2.VideoCapture instance. When provided (and not dry_run), pixel
+            targets are captured at each position and written to robot_vision_targets in the
+            yaml (VIS-06). When None, pixel capture is skipped — existing Phase 1 behavior
+            is fully preserved (D-10, ROB-05).
     """
     cfg = load_config(config_path)
     robot: RobotInterface = build_robot(cfg)
 
     measured_bins: Dict[int, int] = {}
     measured_home: int = cfg.home_encoder_target
+
+    # Pixel-capture counters (VIS-06). Only active when a camera is provided.
+    pixel_captured = 0
+    pixel_skipped = 0
+    _capture_pixel = (cap is not None) and (not dry_run)
 
     try:
         # --- HOME ---
@@ -71,6 +141,14 @@ def run_calibration(
                 _prompt("1. Move the robot to HOME position. Press Enter when ready... ")
             measured_home = robot.get_current_position()
         print(f"  HOME encoder = {measured_home}")
+
+        if _capture_pixel:
+            center = capture_pixel_target(cap, "home")
+            write_pixel_target_to_yaml(str(config_path), "home", center)
+            if center is not None:
+                pixel_captured += 1
+            else:
+                pixel_skipped += 1
 
         # --- BINS ---
         # Derive the set of bin indices from the class_to_bin mapping.
@@ -83,6 +161,16 @@ def run_calibration(
                     _prompt(f"2. Move the robot to BIN {bin_idx}. Press Enter when ready... ")
                 measured_bins[bin_idx] = robot.get_current_position()
             print(f"  BIN {bin_idx} encoder = {measured_bins[bin_idx]}")
+
+            if _capture_pixel:
+                target_name = f"bin_{bin_idx}"
+                center = capture_pixel_target(cap, target_name)
+                write_pixel_target_to_yaml(str(config_path), target_name, center)
+                if center is not None:
+                    pixel_captured += 1
+                else:
+                    pixel_skipped += 1
+
     finally:
         robot.shutdown()
 
@@ -108,6 +196,16 @@ def run_calibration(
 
     print(f"\nWrote calibration to {config_path}")
     print("Reminder: restart station.py to pick up the new values (D-14).")
+
+    if _capture_pixel:
+        total = pixel_captured + pixel_skipped
+        skipped_names = []
+        doc2 = yaml.safe_load(Path(config_path).read_text())
+        rvt = doc2.get("robot_vision_targets") or {}
+        skipped_names = [k for k, v in rvt.items() if v is None]
+        skip_str = (f" — {', '.join(skipped_names)} skipped") if skipped_names else ""
+        print(f"Pixel targets: {pixel_captured}/{total} captured{skip_str}")
+
     return doc
 
 
