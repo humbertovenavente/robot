@@ -6,3 +6,4 @@ Pillow==11.3.0
 pydantic==2.13.0
 PyYAML==6.0.2
 python-ev3dev2==2.1.0.post1 ; sys_platform == "linux"
+pytest==8.4.2
