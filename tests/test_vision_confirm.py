@@ -5,6 +5,12 @@ Covers:
   - compute_drift: correct math, None inputs
 
 All pyzbar interactions are mocked — no camera or zbar binary required.
+
+Mock strategy
+-------------
+vision_confirm._pyzbar may be None when pyzbar is not installed.
+Each test that exercises decode sets up a MagicMock module as _pyzbar
+and patches _PYZBAR_AVAILABLE=True so the code follows the normal path.
 """
 from __future__ import annotations
 
@@ -26,6 +32,21 @@ def _make_decoded(payload_bytes: bytes, left: int = 0, top: int = 0, width: int 
     return SimpleNamespace(data=payload_bytes, rect=rect)
 
 
+def _make_mock_pyzbar(return_value=None, side_effect=None):
+    """Return a MagicMock suitable as a stand-in for the pyzbar module.
+
+    Sets up mock.decode with the given return_value or side_effect so tests
+    can patch vision_confirm._pyzbar with this object regardless of whether
+    the real pyzbar library is installed.
+    """
+    mock_mod = MagicMock()
+    if side_effect is not None:
+        mock_mod.decode.side_effect = side_effect
+    else:
+        mock_mod.decode.return_value = return_value if return_value is not None else []
+    return mock_mod
+
+
 # ---------------------------------------------------------------------------
 # Tests for find_robot_qr
 # ---------------------------------------------------------------------------
@@ -40,10 +61,11 @@ class TestFindRobotQr(unittest.TestCase):
     def test_single_robot_qr_returns_center(self):
         """Rect(left=100, top=200, width=40, height=40) → center (120, 220)."""
         decoded_result = _make_decoded(b"ROBOT", left=100, top=200, width=40, height=40)
+        mock_pyzbar = _make_mock_pyzbar(return_value=[decoded_result])
 
         import vision_confirm
         with patch.object(vision_confirm, "_PYZBAR_AVAILABLE", True), \
-             patch.object(vision_confirm._pyzbar, "decode", return_value=[decoded_result]):
+             patch.object(vision_confirm, "_pyzbar", mock_pyzbar):
             result = vision_confirm.find_robot_qr(self._make_fake_frame())
 
         self.assertEqual(result, (120, 220))
@@ -55,10 +77,11 @@ class TestFindRobotQr(unittest.TestCase):
             _make_decoded(b"B"),
             _make_decoded(b"C"),
         ]
+        mock_pyzbar = _make_mock_pyzbar(return_value=decoded_results)
 
         import vision_confirm
         with patch.object(vision_confirm, "_PYZBAR_AVAILABLE", True), \
-             patch.object(vision_confirm._pyzbar, "decode", return_value=decoded_results):
+             patch.object(vision_confirm, "_pyzbar", mock_pyzbar):
             result = vision_confirm.find_robot_qr(self._make_fake_frame())
 
         self.assertIsNone(result)
@@ -68,10 +91,11 @@ class TestFindRobotQr(unittest.TestCase):
         robot_qr = _make_decoded(b"ROBOT", left=50, top=60, width=20, height=30)
         package_qr = _make_decoded(b"A", left=200, top=300, width=40, height=40)
         decoded_results = [robot_qr, package_qr]
+        mock_pyzbar = _make_mock_pyzbar(return_value=decoded_results)
 
         import vision_confirm
         with patch.object(vision_confirm, "_PYZBAR_AVAILABLE", True), \
-             patch.object(vision_confirm._pyzbar, "decode", return_value=decoded_results):
+             patch.object(vision_confirm, "_pyzbar", mock_pyzbar):
             result = vision_confirm.find_robot_qr(self._make_fake_frame())
 
         # cx = 50 + 20/2 = 60, cy = 60 + 30/2 = 75
@@ -79,32 +103,37 @@ class TestFindRobotQr(unittest.TestCase):
 
     # Test 4: zero decoded results → returns None
     def test_no_qr_results_returns_none(self):
+        mock_pyzbar = _make_mock_pyzbar(return_value=[])
+
         import vision_confirm
         with patch.object(vision_confirm, "_PYZBAR_AVAILABLE", True), \
-             patch.object(vision_confirm._pyzbar, "decode", return_value=[]):
+             patch.object(vision_confirm, "_pyzbar", mock_pyzbar):
             result = vision_confirm.find_robot_qr(self._make_fake_frame())
 
         self.assertIsNone(result)
 
     # Test 5: pyzbar.decode raises ValueError → returns None (never propagates)
     def test_decode_raises_returns_none(self):
+        mock_pyzbar = _make_mock_pyzbar(side_effect=ValueError("zbar error"))
+
         import vision_confirm
         with patch.object(vision_confirm, "_PYZBAR_AVAILABLE", True), \
-             patch.object(vision_confirm._pyzbar, "decode", side_effect=ValueError("zbar error")):
+             patch.object(vision_confirm, "_pyzbar", mock_pyzbar):
             result = vision_confirm.find_robot_qr(self._make_fake_frame())
 
         self.assertIsNone(result)
 
     # Test 6: frame=None → returns None without calling pyzbar
     def test_none_frame_returns_none_without_decode(self):
+        mock_pyzbar = _make_mock_pyzbar(return_value=[])
+
         import vision_confirm
-        mock_decode = MagicMock()
         with patch.object(vision_confirm, "_PYZBAR_AVAILABLE", True), \
-             patch.object(vision_confirm._pyzbar, "decode", mock_decode):
+             patch.object(vision_confirm, "_pyzbar", mock_pyzbar):
             result = vision_confirm.find_robot_qr(None)
 
         self.assertIsNone(result)
-        mock_decode.assert_not_called()
+        mock_pyzbar.decode.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
