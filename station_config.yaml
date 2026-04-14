@@ -1,0 +1,21 @@
+station_id: station-1
+camera_index: 0
+yolo_model_path: models/best.pt
+yolo_confidence_threshold: 0.40
+yolo_imgsz: 640
+qr_padding_pct: 0.15         # 15% padding on YOLO bbox before pyzbar (Pitfall #4)
+qr_retry_count: 3
+qr_settle_delay_ms: 500       # Delay after package arrival before decode (Pitfall #3)
+robot_implementation: stub    # one of: stub | ev3 | spike
+class_to_bin:
+  A: 1
+  B: 2
+  C: 3
+home_encoder_target: 0        # degrees; calibration writes this
+bin_encoder_targets:          # degrees per bin; calibration writes these
+  1: 0
+  2: 120
+  3: 240
+motor_speed_deg_per_sec: 180
+cycle_watchdog_timeout_s: 30
+log_dir: logs
