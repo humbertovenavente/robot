@@ -27,6 +27,7 @@ from robot import RobotInterface, build_robot
 from vision import VisionPipeline, Detection, load_vision
 from qr import decode_from_frame
 from event_log import EventLogger, LogEntry
+from vision_confirm import find_robot_qr, compute_drift
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +63,37 @@ class Station:
         self.state = StationState(station_id=getattr(config, "station_id", "station-1"))
         self._cycle_lock = False        # D-10 / ROB-04: local cycle lock
         self._stop = False
+        # D-17: one-time startup warning when enabled but no targets calibrated
+        if config.vision_confirm_enabled:
+            targets = config.robot_vision_targets or {}
+            if not any(v is not None for v in targets.values()):
+                log.warning(
+                    "vision_confirm_enabled=true but no targets calibrated — skipping checks"
+                )
+
+    def _vision_check(self, frame, target_name: str):
+        """Return (vision_confirmed, drift_px, vision_reason).
+        Called only when config.vision_confirm_enabled is True.
+        Reuses the current cycle's frame — Station has no self._camera (D-19
+        forbids Phase 2 plumbing changes; camera stays local to run())."""
+        expected = (self.config.robot_vision_targets or {}).get(target_name)
+        if expected is None:
+            return (None, None, "no_target_calibrated")   # D-17
+        try:
+            if frame is None:
+                return (False, None, "robot_qr_not_found")
+            observed = find_robot_qr(frame)
+            if observed is None:
+                return (False, None, "robot_qr_not_found")   # D-09
+            drift = compute_drift(observed, tuple(expected))
+            if drift is None:
+                return (False, None, "robot_qr_not_found")
+            tol = self.config.vision_confirm_tolerance_px
+            if drift <= tol:
+                return (True, drift, "ok")
+            return (False, drift, "drift_exceeded")          # D-14
+        except Exception as e:                                # D-15 observability-only
+            return (False, None, f"error:{type(e).__name__}")
 
     def _set_status(self, status: str) -> None:
         self.state.status = status
@@ -106,8 +138,16 @@ class Station:
             # Robot cycle (ROB-01..03). Any exception below is caught and logged as error.
             try:
                 self.robot.move_to_bin(dest_bin)
+                if self.config.vision_confirm_enabled:
+                    vc_bin = self._vision_check(frame, f"bin_{dest_bin}")
+                else:
+                    vc_bin = (None, None, None)
                 self.robot.deposit()
                 self.robot.return_home()
+                if self.config.vision_confirm_enabled:
+                    vc_home = self._vision_check(frame, "home")
+                else:
+                    vc_home = (None, None, None)
             except Exception as e:
                 elapsed_ms = int((time.monotonic() - cycle_start) * 1000)
                 self._set_status("error")
@@ -120,7 +160,12 @@ class Station:
             self.state.last_cycle_ms = elapsed_ms
             self.state.cycle_count += 1
             self._set_status("free")
-            entry = self.log.write(class_letter, dest_bin, elapsed_ms, "completed", None)
+            entry = self.log.write(
+                class_letter, dest_bin, elapsed_ms, "completed", None,
+                vision_confirmed=vc_home[0],
+                drift_px=vc_home[1],
+                vision_reason=vc_home[2],
+            )
             return entry
         finally:
             self._cycle_lock = False   # PITFALLS #8: always release
