@@ -62,7 +62,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 Plans:
 - [x] 02.1-01-config-eventlog-requirements-PLAN.md — Config fields, station_config.yaml keys, EventLogger optional vision kwargs, REQ-IDs (VIS-08)
-- [ ] 02.1-02-vision-confirm-module-PLAN.md — New vision_confirm.py with find_robot_qr + compute_drift (VIS-05, VIS-07)
+- [x] 02.1-02-vision-confirm-module-PLAN.md — New vision_confirm.py with find_robot_qr + compute_drift (VIS-05, VIS-07)
 - [ ] 02.1-03-calibrate-pixel-capture-PLAN.md — calibrate.py pixel-target sub-flow with yaml round-trip (VIS-06)
 - [ ] 02.1-04-station-integration-PLAN.md — Station post-motion hooks + JSONL extension + lock-preserving try/except (VIS-05, VIS-06, VIS-07, VIS-08)
 - [ ] 02.1-05-integration-regression-PLAN.md — End-to-end + disabled-path regression + REQ-ID coverage audit (VIS-05..08)

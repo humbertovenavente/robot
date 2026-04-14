@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 02.1-01-config-eventlog-requirements-PLAN.md
-last_updated: "2026-04-14T17:05:17.089Z"
+stopped_at: Completed 02.1-02-vision-confirm-module-PLAN.md
+last_updated: "2026-04-14T17:09:54.558Z"
 last_activity: 2026-04-14
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 16
-  completed_plans: 12
-  percent: 75
+  completed_plans: 13
+  percent: 81
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-13)
 ## Current Position
 
 Phase: 02.1 (vision-robot-tracking) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
 Last activity: 2026-04-14
 
@@ -58,6 +58,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 02-orchestrator-dashboard P04 | 15 | 2 tasks | 5 files |
 | Phase 02-orchestrator-dashboard P05 | 10 | 1 tasks | 1 files |
 | Phase 02.1-vision-robot-tracking P01 | 10 | 3 tasks | 5 files |
+| Phase 02.1-vision-robot-tracking P02 | 15 | 1 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -86,6 +87,7 @@ Recent decisions affecting current work:
 - [Phase 02-orchestrator-dashboard]: Added registry.reset() in client fixture for test isolation; used _Cfg helper to avoid importing Config for standalone tests; orchestrator-down test uses port 1 (always refused)
 - [Phase 02.1-01]: vision_confirmed/drift_px/vision_reason omitted from to_dict() when all None — preserves Phase 1 D-16 JSONL schema byte-identically
 - [Phase 02.1-01]: EventLogger.write uses keyword-only boundary so existing positional callers are unchanged
+- [Phase 02.1-vision-robot-tracking]: New vision_confirm.py module keeps A/B/C allow-list uncontaminated (D-04); tests patch _pyzbar as full MagicMock to handle environments without pyzbar installed
 
 ### Pending Todos
 
@@ -99,6 +101,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-14T17:05:17.087Z
-Stopped at: Completed 02.1-01-config-eventlog-requirements-PLAN.md
+Last session: 2026-04-14T17:09:54.556Z
+Stopped at: Completed 02.1-02-vision-confirm-module-PLAN.md
 Resume file: None
