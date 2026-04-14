@@ -23,3 +23,12 @@ log_dir: logs
 # Phase 2 orchestrator endpoint (D-05). Leave commented/empty to run standalone (D-06, ORC-04).
 # Format: ws://<host>:<port>/ws  (no role query — ws_client adds ?role=station)
 # orchestrator_url: ws://127.0.0.1:8000/ws
+
+# Phase 02.1 — vision-based robot QR tracking (observability overlay, default off)
+vision_confirm_enabled: false                  # D-16: set true to activate post-motion QR check
+vision_confirm_tolerance_px: 30               # D-13: Euclidean pixel drift threshold
+robot_vision_targets:                         # D-11: expected ROBOT-QR pixel centers per position
+  home: null
+  bin_1: null
+  bin_2: null
+  bin_3: null

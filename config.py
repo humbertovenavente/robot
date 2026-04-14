@@ -12,10 +12,10 @@ Config is read-only once loaded. Reload by calling load_config() again.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Literal, Optional
+from typing import Dict, List, Literal, Optional, Union
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # Repo root is the directory containing this file.
 # Use pathlib — no absolute hardcoded paths anywhere (PITFALLS.md #11).
@@ -41,6 +41,34 @@ class Config(BaseModel):
     motor_speed_deg_per_sec: int = 180
     cycle_watchdog_timeout_s: int = 30
     log_dir: str = "logs"
+
+    # Phase 02.1 — vision-confirm fields (D-11, D-13, D-16)
+    vision_confirm_enabled: bool = False  # D-16: default off; Phase 1 behavior preserved when False
+    vision_confirm_tolerance_px: int = 30  # D-13: Euclidean pixel drift threshold
+    robot_vision_targets: Dict[str, Optional[List[int]]] = Field(
+        default_factory=lambda: {"home": None, "bin_1": None, "bin_2": None, "bin_3": None}
+    )  # D-11: expected ROBOT-QR pixel centers per position; null = not calibrated
+
+    @field_validator("robot_vision_targets", mode="before")
+    @classmethod
+    def _validate_vision_targets(
+        cls, v: Optional[Dict]
+    ) -> Dict[str, Optional[List[int]]]:
+        """Ensure each non-null target is a 2-element list of ints."""
+        if v is None:
+            return {"home": None, "bin_1": None, "bin_2": None, "bin_3": None}
+        validated: Dict[str, Optional[List[int]]] = {}
+        for key, val in v.items():
+            if val is None:
+                validated[key] = None
+            else:
+                coords = list(val)
+                if len(coords) != 2:
+                    raise ValueError(
+                        f"robot_vision_targets[{key!r}] must be a 2-element [cx, cy] list, got {coords!r}"
+                    )
+                validated[key] = [int(coords[0]), int(coords[1])]
+        return validated
 
     @property
     def orchestrator_enabled(self) -> bool:
