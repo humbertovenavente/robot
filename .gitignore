@@ -11,3 +11,4 @@ data/dataset/labels/
 .DS_Store
 *.egg-info/
 station_config.local.yaml
+.planning/
