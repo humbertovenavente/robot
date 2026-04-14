@@ -4,6 +4,19 @@
 
 An automated package-sorting system where a LEGO MINDSTORMS robot classifies packages using computer vision (YOLO) and QR codes, routes each package to the correct destination bin, and returns to home position. A central orchestrator coordinates multiple stations running simultaneously in the lab. Academic project — visual demo for class.
 
+## Current Milestone: v1.0 Demo-Ready Package Sorter
+
+**Goal:** Ship a working LEGO + YOLO package sorter — single-station happy path plus multi-station orchestration — by Thursday 2026-04-16.
+
+**Target features:**
+- YOLO model trained on 3 QR-coded package classes
+- QR decoding pipeline extracting class from detected region
+- Station controller: pickup → destination bin → return home
+- Cycle lock, event logging, station status reporting
+- Central orchestrator coordinating ≥2 stations
+- Live instructor dashboard
+- Basic error handling and calibration routine
+
 ## Core Value
 
 End-to-end autonomous cycle: **camera sees package → YOLO + QR identify class → robot delivers it to the right bin → robot returns home → orchestrator logs the event.** If nothing else works, this single-station happy path must work on demo day.
@@ -82,4 +95,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-13 after initialization*
+*Last updated: 2026-04-13 after starting milestone v1.0*

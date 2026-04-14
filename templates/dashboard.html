@@ -12,8 +12,27 @@
     <div id="conn-banner" class="banner hidden">Disconnected — reconnecting…</div>
   </header>
   <main>
+    <!-- Camera panel -->
+    <section class="cam-panel">
+      <div class="cam-header">
+        <h2>Camera Feed</h2>
+        <div class="cam-controls">
+          <select id="cam-select"><option value="">Select camera…</option></select>
+          <button id="cam-refresh" title="Refresh camera list">&#8635;</button>
+          <button id="cam-start">Start</button>
+          <button id="cam-stop" disabled>Stop</button>
+        </div>
+      </div>
+      <div class="cam-container">
+        <video id="cam-video" autoplay playsinline muted></video>
+        <canvas id="cam-canvas"></canvas>
+        <div id="cam-overlay" class="cam-placeholder">No camera — click Start</div>
+        <div id="qr-result" class="qr-result hidden"></div>
+      </div>
+    </section>
+
+    <!-- Station cards -->
     <section id="cards" class="grid" aria-live="polite">
-      <!-- station cards injected by dashboard.js -->
     </section>
     <p id="empty-state" class="empty">Waiting for stations…</p>
   </main>

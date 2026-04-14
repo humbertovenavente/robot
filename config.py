@@ -42,6 +42,15 @@ class Config(BaseModel):
     cycle_watchdog_timeout_s: int = 30
     log_dir: str = "logs"
 
+    # Obstacle detection — OBS-01
+    obstacle_detection_enabled: bool = False       # set True to activate
+    obstacle_model_path: str = "yolov8n.pt"        # COCO-pretrained; already in repo root
+    obstacle_confidence_threshold: float = Field(ge=0.0, le=1.0, default=0.60)
+    obstacle_classes: List[int] = Field(default_factory=list)  # empty = all 80 COCO classes
+    obstacle_roi: Optional[List[int]] = None       # [x1%, y1%, x2%, y2%] path zone; null = full frame
+    obstacle_block_frames: int = 3   # consecutive blocked frames required to trigger halt
+    obstacle_clear_frames: int = 4   # consecutive clear frames required to resume
+
     # Phase 02.1 — vision-confirm fields (D-11, D-13, D-16)
     vision_confirm_enabled: bool = False  # D-16: default off; Phase 1 behavior preserved when False
     vision_confirm_tolerance_px: int = 30  # D-13: Euclidean pixel drift threshold

@@ -29,6 +29,7 @@ from vision import VisionPipeline, Detection, load_vision
 from qr import decode_from_frame
 from event_log import EventLogger, LogEntry
 from vision_confirm import find_robot_qr, compute_drift
+from obstacle_detector import build_obstacle_detector
 
 log = logging.getLogger(__name__)
 
@@ -37,11 +38,13 @@ log = logging.getLogger(__name__)
 class StationState:
     """Public state exposed for Phase 2 orchestrator wiring."""
     station_id: str
-    status: str = "free"                 # free | processing | unknown_package | error
+    status: str = "free"                 # free | processing | unknown_package | error | path_blocked
     last_class: Optional[str] = None
     last_destination: Optional[int] = None
     last_cycle_ms: Optional[int] = None
     cycle_count: int = 0
+    path_blocked: bool = False           # OBS-01: True while travel zone is occupied
+    blocking_object: Optional[str] = None  # COCO class name of blocking object
 
 
 StatusListener = Callable[[StationState], None]
@@ -65,6 +68,9 @@ class Station:
         self._cycle_lock = False        # D-10 / ROB-04: local cycle lock
         self._stop = False
         self._halted = False           # D-04: permanent halt flag (ERR-02/03)
+        self._obstacle_detector = build_obstacle_detector(config)  # OBS-01; None if disabled
+        self._obs_blocked_streak: int = 0   # consecutive frames with obstacle
+        self._obs_clear_streak: int = 0     # consecutive frames without obstacle
         # D-17: one-time startup warning when enabled but no targets calibrated
         if config.vision_confirm_enabled:
             targets = config.robot_vision_targets or {}
@@ -210,6 +216,33 @@ class Station:
             return (self.state, None)   # ROB-04: ignore detections mid-cycle
         if self._halted:
             return (self.state, None)   # D-04: permanent halt — frames consumed, cycles suppressed
+
+        # OBS-01: obstacle check with debounce to prevent single-frame flicker
+        if self._obstacle_detector is not None:
+            blocked, obj_name = self._obstacle_detector.is_blocked(frame)
+            if blocked:
+                self._obs_blocked_streak += 1
+                self._obs_clear_streak = 0
+                if self._obs_blocked_streak >= self.config.obstacle_block_frames:
+                    if not self.state.path_blocked:
+                        self.state.path_blocked = True
+                        self.state.blocking_object = obj_name
+                        self._set_status("path_blocked")
+                        log.warning("Path blocked by '%s' — robot paused", obj_name)
+                    return (self.state, None)
+                # streak not yet met — treat as clear for now
+            else:
+                self._obs_clear_streak += 1
+                self._obs_blocked_streak = 0
+                if self.state.path_blocked:
+                    if self._obs_clear_streak >= self.config.obstacle_clear_frames:
+                        self.state.path_blocked = False
+                        self.state.blocking_object = None
+                        self._set_status("free")
+                        log.info("Path clear — resuming cycles")
+                    else:
+                        return (self.state, None)  # still in clear grace period
+
         detection = self.vision.detect(frame)
         if detection is None:
             return (self.state, None)
@@ -274,8 +307,13 @@ def run_station(
 
 
 def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=None, help="Path to station config YAML")
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    station = run_station()
+    cfg = load_config(args.config) if args.config else load_config()
+    station = run_station(config=cfg)
     station.run()
     return 0
 

@@ -21,11 +21,13 @@ class StatusMsg(BaseModel):
     """Station -> Orchestrator: one per StationState transition (D-02)."""
     type: Literal["status"] = "status"
     station_id: str
-    status: str           # free | processing | unknown_package | error
+    status: str           # free | processing | unknown_package | error | path_blocked
     last_class: Optional[str] = None
     last_destination: Optional[int] = None
     last_cycle_ms: Optional[int] = None
     cycle_count: int = 0
+    path_blocked: bool = False          # OBS-01: True while robot travel zone is occupied
+    blocking_object: Optional[str] = None  # COCO class name of the blocking object
 
 
 class StationUpdateMsg(BaseModel):
@@ -38,6 +40,8 @@ class StationUpdateMsg(BaseModel):
     last_cycle_ms: Optional[int] = None
     cycle_count: int = 0
     online: bool = True   # False when orchestrator detects station WS drop
+    path_blocked: bool = False          # OBS-01
+    blocking_object: Optional[str] = None
 
 
 Inbound = Union[RegisterMsg, StatusMsg]
@@ -73,6 +77,8 @@ def state_to_status_msg(state) -> StatusMsg:
         last_destination=state.last_destination,
         last_cycle_ms=state.last_cycle_ms,
         cycle_count=state.cycle_count,
+        path_blocked=getattr(state, "path_blocked", False),
+        blocking_object=getattr(state, "blocking_object", None),
     )
 
 
@@ -86,4 +92,6 @@ def state_to_station_update(state, online: bool = True) -> StationUpdateMsg:
         last_cycle_ms=state.last_cycle_ms,
         cycle_count=state.cycle_count,
         online=online,
+        path_blocked=getattr(state, "path_blocked", False),
+        blocking_object=getattr(state, "blocking_object", None),
     )

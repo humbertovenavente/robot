@@ -1,0 +1,5 @@
+path: /Users/humbertovenavente/CascadeProjects/windsurf-project/datasets/robot_detector
+train: images/train
+val:   images/val
+nc: 1
+names: ['robot']

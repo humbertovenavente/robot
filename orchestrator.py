@@ -46,6 +46,8 @@ class StationRecord:
     last_cycle_ms: Optional[int] = None
     cycle_count: int = 0
     online: bool = True
+    path_blocked: bool = False          # OBS-01
+    blocking_object: Optional[str] = None
 
 
 class Registry:
@@ -91,6 +93,8 @@ class Registry:
             rec.last_cycle_ms = msg.last_cycle_ms
             rec.cycle_count = msg.cycle_count
             rec.online = True
+            rec.path_blocked = msg.path_blocked
+            rec.blocking_object = msg.blocking_object
             return rec
 
     async def add_dashboard(self, ws: WebSocket) -> list:
@@ -123,6 +127,8 @@ def _record_to_update(rec: StationRecord) -> StationUpdateMsg:
         last_cycle_ms=rec.last_cycle_ms,
         cycle_count=rec.cycle_count,
         online=rec.online,
+        path_blocked=rec.path_blocked,
+        blocking_object=rec.blocking_object,
     )
 
 

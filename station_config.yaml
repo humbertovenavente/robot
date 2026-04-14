@@ -22,7 +22,18 @@ log_dir: logs
 
 # Phase 2 orchestrator endpoint (D-05). Leave commented/empty to run standalone (D-06, ORC-04).
 # Format: ws://<host>:<port>/ws  (no role query — ws_client adds ?role=station)
-# orchestrator_url: ws://127.0.0.1:8000/ws
+orchestrator_url: ws://127.0.0.1:8000/ws
+
+# Obstacle detection — OBS-01 (set obstacle_detection_enabled: true to activate)
+# Uses yolov8n.pt (COCO, already in repo root) to detect objects in the robot's path.
+# obstacle_classes: []           # empty = all 80 COCO classes count as obstacles
+#                                # e.g. [0] = person only, [0, 56, 57] = person+chair+couch
+# obstacle_roi: [10, 30, 90, 90] # [x1%, y1%, x2%, y2%] — crop to robot travel zone only
+obstacle_detection_enabled: false
+obstacle_model_path: yolov8n.pt
+obstacle_confidence_threshold: 0.50
+obstacle_classes: []
+obstacle_roi: null
 
 # Phase 02.1 — vision-based robot QR tracking (observability overlay, default off)
 vision_confirm_enabled: false                  # D-16: set true to activate post-motion QR check

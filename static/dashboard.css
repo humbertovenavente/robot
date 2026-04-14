@@ -4,7 +4,29 @@ body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
 .topbar h1 { margin: 0; font-size: 20px; font-weight: 600; }
 .banner { background: #b45309; color: #fff; padding: 8px 16px; border-radius: 6px; font-size: 14px; }
 .banner.hidden { display: none; }
-main { padding: 24px; }
+main { padding: 24px; display: flex; flex-direction: column; gap: 24px; }
+
+/* Camera panel */
+.cam-panel { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; }
+.cam-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.cam-header h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.cam-controls { display: flex; gap: 8px; align-items: center; }
+.cam-controls select { background: #0f172a; color: #f1f5f9; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+.cam-controls button { padding: 6px 14px; border-radius: 6px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; }
+#cam-start { background: #22c55e; color: #052e16; }
+#cam-stop { background: #ef4444; color: #fff; }
+#cam-refresh { background: #334155; color: #94a3b8; padding: 6px 10px; font-size: 15px; }
+#cam-refresh:hover { background: #475569; color: #f1f5f9; }
+#cam-start:disabled, #cam-stop:disabled { opacity: 0.4; cursor: default; }
+.cam-container { position: relative; width: 100%; max-width: 640px; aspect-ratio: 4/3; background: #0f172a; border-radius: 8px; overflow: hidden; }
+#cam-video { width: 100%; height: 100%; object-fit: cover; display: none; }
+#cam-canvas { display: none; }
+.cam-placeholder { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #475569; font-size: 14px; }
+.qr-result { position: absolute; bottom: 12px; left: 12px; right: 12px; background: rgba(34,197,94,0.9); color: #052e16; border-radius: 8px; padding: 10px 14px; font-size: 15px; font-weight: 700; text-align: center; }
+.qr-result.hidden { display: none; }
+.qr-result.unknown { background: rgba(234,179,8,0.9); color: #3a2a05; }
+
+/* Station cards */
 .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
 .card { position: relative; background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; min-height: 140px; transition: transform 0.15s; }
 .card h2 { margin: 0 0 12px 0; font-size: 16px; font-weight: 600; }
@@ -13,8 +35,10 @@ main { padding: 24px; }
 .badge.processing { background: #3b82f6; color: #0c1e42; }
 .badge.unknown_package { background: #eab308; color: #3a2a05; }
 .badge.error { background: #ef4444; color: #3b0a0a; }
+.badge.path_blocked { background: #f97316; color: #1c0a00; }
 .event-line { margin-top: 12px; color: #cbd5e1; font-size: 14px; font-variant-numeric: tabular-nums; }
 .event-line .muted { color: #64748b; }
+.event-line .obstacle-warn { color: #fb923c; font-weight: 600; }
 .offline-overlay { position: absolute; inset: 0; background: rgba(15, 23, 42, 0.75); border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 16px; font-weight: 600; color: #f87171; }
 .card.online .offline-overlay { display: none; }
 .empty { color: #94a3b8; text-align: center; padding: 32px; }

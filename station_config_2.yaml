@@ -1,0 +1,30 @@
+station_id: station-2
+camera_index: 1
+yolo_model_path: models/best.pt
+yolo_confidence_threshold: 0.40
+yolo_imgsz: 640
+qr_padding_pct: 0.15
+qr_retry_count: 3
+qr_settle_delay_ms: 500
+robot_implementation: stub
+class_to_bin:
+  A: 1
+  B: 2
+  C: 3
+home_encoder_target: 0
+bin_encoder_targets:
+  1: 0
+  2: 120
+  3: 240
+motor_speed_deg_per_sec: 180
+cycle_watchdog_timeout_s: 30
+log_dir: logs/station-2
+orchestrator_url: ws://127.0.0.1:8000/ws
+vision_confirm_enabled: false
+
+# Obstacle detection
+obstacle_detection_enabled: true
+obstacle_model_path: models/robot_detector.pt
+obstacle_confidence_threshold: 0.55
+obstacle_classes: [0]
+obstacle_roi: null
