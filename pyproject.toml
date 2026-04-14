@@ -1,0 +1,6 @@
+[project]
+name = "lego-yolo-sorter"
+version = "0.1.0"
+description = "Automated package-sorting system using LEGO MINDSTORMS and YOLOv8"
+requires-python = ">=3.11,<3.12"
+readme = "README.md"

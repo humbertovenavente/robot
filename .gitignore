@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+logs/
+runs/
+models/*.pt
+data/raw/
+data/dataset/images/
+data/dataset/labels/
+.DS_Store
+*.egg-info/
+station_config.local.yaml

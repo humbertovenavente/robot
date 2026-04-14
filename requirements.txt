@@ -1,0 +1,8 @@
+ultralytics==8.4.37
+opencv-python==4.13.0.92
+pyzbar==0.1.9
+numpy==2.0.2
+Pillow==11.3.0
+pydantic==2.13.0
+PyYAML==6.0.2
+python-ev3dev2==2.1.0.post1 ; sys_platform == "linux"
