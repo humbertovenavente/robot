@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 02.1-04-station-integration-PLAN.md
-last_updated: "2026-04-14T17:19:07.237Z"
+status: verifying
+stopped_at: Completed 02.1-05-integration-regression-PLAN.md
+last_updated: "2026-04-14T17:23:09.673Z"
 last_activity: 2026-04-14
 progress:
   total_phases: 4
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 16
-  completed_plans: 15
-  percent: 94
+  completed_plans: 16
+  percent: 100
 ---
 
 # Project State
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-04-13)
 
 Phase: 02.1 (vision-robot-tracking) — EXECUTING
 Plan: 5 of 5
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-04-14
 
 Progress: [░░░░░░░░░░] 0%
@@ -61,6 +61,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 02.1-vision-robot-tracking P02 | 15 | 1 tasks | 2 files |
 | Phase 02.1-vision-robot-tracking P03 | 15 | 1 tasks | 2 files |
 | Phase 02.1-vision-robot-tracking P04 | 15m | 2 tasks | 2 files |
+| Phase 02.1-vision-robot-tracking P05 | 8 | 1 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -94,6 +95,8 @@ Recent decisions affecting current work:
 - [Phase 02.1-vision-robot-tracking]: sort_keys=False on yaml safe_dump minimises diff churn against existing station_config.yaml
 - [Phase 02.1-vision-robot-tracking]: JSONL entry records home-check vision fields as final state per D-08; vc_bin stored for future status_listener extension
 - [Phase 02.1-vision-robot-tracking]: _vision_check wraps pyzbar in try/except so exceptions cannot escape to cycle lock try/finally block
+- [Phase 02.1-vision-robot-tracking]: Used real EventLogger + tmp_path for JSONL key-set regression assertions
+- [Phase 02.1-vision-robot-tracking]: Phase 1 D-16 schema frozen as PHASE1_SCHEMA_KEYS constant for deterministic disabled-path test
 
 ### Pending Todos
 
@@ -107,6 +110,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-14T17:19:07.234Z
-Stopped at: Completed 02.1-04-station-integration-PLAN.md
+Last session: 2026-04-14T17:23:09.671Z
+Stopped at: Completed 02.1-05-integration-regression-PLAN.md
 Resume file: None
