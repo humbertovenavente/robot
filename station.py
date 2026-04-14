@@ -175,6 +175,9 @@ def run_station(
     status_listener: Optional[StatusListener] = None,
 ) -> Station:
     cfg = config or load_config()
+    if status_listener is None and getattr(cfg, "orchestrator_enabled", False):
+        from ws_client import build_status_listener  # lazy import — D-06 / ORC-04
+        status_listener = build_status_listener(cfg)
     robot = build_robot(cfg)
     vision = load_vision(cfg)
     log_dir = getattr(cfg, "resolved_log_dir", None) or "logs"
