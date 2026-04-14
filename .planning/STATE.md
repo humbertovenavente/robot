@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 02.1-03-calibrate-pixel-capture-PLAN.md
-last_updated: "2026-04-14T17:14:11.438Z"
+stopped_at: Completed 02.1-04-station-integration-PLAN.md
+last_updated: "2026-04-14T17:19:07.237Z"
 last_activity: 2026-04-14
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 16
-  completed_plans: 14
-  percent: 88
+  completed_plans: 15
+  percent: 94
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-13)
 ## Current Position
 
 Phase: 02.1 (vision-robot-tracking) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: Ready to execute
 Last activity: 2026-04-14
 
@@ -60,6 +60,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 02.1-vision-robot-tracking P01 | 10 | 3 tasks | 5 files |
 | Phase 02.1-vision-robot-tracking P02 | 15 | 1 tasks | 2 files |
 | Phase 02.1-vision-robot-tracking P03 | 15 | 1 tasks | 2 files |
+| Phase 02.1-vision-robot-tracking P04 | 15m | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -91,6 +92,8 @@ Recent decisions affecting current work:
 - [Phase 02.1-vision-robot-tracking]: New vision_confirm.py module keeps A/B/C allow-list uncontaminated (D-04); tests patch _pyzbar as full MagicMock to handle environments without pyzbar installed
 - [Phase 02.1-vision-robot-tracking]: cap=None default on run_calibration preserves full Phase 1 ROB-05 behavior with no regression
 - [Phase 02.1-vision-robot-tracking]: sort_keys=False on yaml safe_dump minimises diff churn against existing station_config.yaml
+- [Phase 02.1-vision-robot-tracking]: JSONL entry records home-check vision fields as final state per D-08; vc_bin stored for future status_listener extension
+- [Phase 02.1-vision-robot-tracking]: _vision_check wraps pyzbar in try/except so exceptions cannot escape to cycle lock try/finally block
 
 ### Pending Todos
 
@@ -104,6 +107,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-14T17:14:11.436Z
-Stopped at: Completed 02.1-03-calibrate-pixel-capture-PLAN.md
+Last session: 2026-04-14T17:19:07.234Z
+Stopped at: Completed 02.1-04-station-integration-PLAN.md
 Resume file: None
