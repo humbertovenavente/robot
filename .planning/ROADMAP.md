@@ -80,9 +80,9 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 03-01-PLAN.md — station.py error handling: _halted flag, watchdog timer, _halt() helper, unknown-package free reset (ERR-01, ERR-02, ERR-03)
+- [x] 03-01-PLAN.md — station.py error handling: _halted flag, watchdog timer, _halt() helper, unknown-package free reset (ERR-01, ERR-02, ERR-03)
 - [ ] 03-02-PLAN.md — Error-handling test suite: 5 pytest tests for ERR-01/02/03 behaviors + regression (ERR-01, ERR-02, ERR-03)
-- [ ] 03-03-PLAN.md — DEMO_CHECKLIST.md + human checkpoint: pre-demo operator runbook + demo execution (DEM-01, DEM-02, DEM-03)
+- [x] 03-03-PLAN.md — DEMO_CHECKLIST.md + human checkpoint: pre-demo operator runbook + demo execution (DEM-01, DEM-02, DEM-03)
 
 ## Progress
 
@@ -93,4 +93,4 @@ Phases execute in numeric order: 1 → 2 → 3
 |-------|----------------|--------|-----------|
 | 1. Vision Pipeline + Robot Core | 5/6 | In Progress|  |
 | 2. Orchestrator + Dashboard | 4/5 | In Progress|  |
-| 3. Error Handling + Demo Prep | 0/3 | Not started | - |
+| 3. Error Handling + Demo Prep | 2/3 | In Progress|  |

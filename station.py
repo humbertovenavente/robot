@@ -189,7 +189,9 @@ class Station:
             self.state.last_destination = dest_bin
             self.state.last_cycle_ms = elapsed_ms
             self.state.cycle_count += 1
-            self._set_status("free")
+            # D-03: if watchdog fired mid-cycle and set _halted, do not overwrite "error"
+            if not self._halted:
+                self._set_status("free")
             entry = self.log.write(
                 class_letter, dest_bin, elapsed_ms, "completed", None,
                 vision_confirmed=vc_home[0],

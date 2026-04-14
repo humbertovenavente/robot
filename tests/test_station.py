@@ -66,7 +66,7 @@ def test_run_once_unknown_package_skips_robot(tmp_path):
     assert entry.status == "unknown_package"
     assert entry.cls == "unknown"
     assert entry.destination_bin is None
-    assert state.status == "unknown_package"
+    assert state.status == "free"
     robot.move_to_bin.assert_not_called()
 
 
