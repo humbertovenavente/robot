@@ -17,6 +17,11 @@ import sys
 import time
 from pathlib import Path
 
+# Ensure repo root is importable when running as `python scripts/capture_dataset.py` from any cwd.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import cv2
 
 from config import load_config, REPO_ROOT
