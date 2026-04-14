@@ -53,6 +53,20 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] 02-05-integration-tests-PLAN.md — end-to-end tests proving the 4 ROADMAP success criteria (ORC-03, ORC-04)
 **UI hint**: yes
 
+### Phase 02.1: vision-robot-tracking (INSERTED)
+
+**Goal:** Camera confirms that the LEGO robot reached the expected encoder target after each motion command — observability overlay that logs pixel drift per cycle without driving motion. Default-off (`vision_confirm_enabled: false`) preserves Phase 1 behavior byte-identically.
+**Requirements**: VIS-05, VIS-06, VIS-07, VIS-08
+**Depends on:** Phase 2
+**Plans:** 1/5 plans executed
+
+Plans:
+- [x] 02.1-01-config-eventlog-requirements-PLAN.md — Config fields, station_config.yaml keys, EventLogger optional vision kwargs, REQ-IDs (VIS-08)
+- [ ] 02.1-02-vision-confirm-module-PLAN.md — New vision_confirm.py with find_robot_qr + compute_drift (VIS-05, VIS-07)
+- [ ] 02.1-03-calibrate-pixel-capture-PLAN.md — calibrate.py pixel-target sub-flow with yaml round-trip (VIS-06)
+- [ ] 02.1-04-station-integration-PLAN.md — Station post-motion hooks + JSONL extension + lock-preserving try/except (VIS-05, VIS-06, VIS-07, VIS-08)
+- [ ] 02.1-05-integration-regression-PLAN.md — End-to-end + disabled-path regression + REQ-ID coverage audit (VIS-05..08)
+
 ### Phase 3: Error Handling + Demo Prep
 **Goal**: The system handles the three RF-12 failure modes gracefully and passes the full pre-demo checklist on actual demo hardware in the actual demo room
 **Depends on**: Phase 2

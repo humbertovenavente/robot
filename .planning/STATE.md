@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: Completed 02-05-integration-tests-PLAN.md
-last_updated: "2026-04-14T15:55:51.751Z"
+status: executing
+stopped_at: Completed 02.1-01-config-eventlog-requirements-PLAN.md
+last_updated: "2026-04-14T17:05:17.089Z"
 last_activity: 2026-04-14
 progress:
-  total_phases: 3
+  total_phases: 4
   completed_phases: 2
-  total_plans: 11
-  completed_plans: 11
-  percent: 100
+  total_plans: 16
+  completed_plans: 12
+  percent: 75
 ---
 
 # Project State
@@ -21,13 +21,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-13)
 
 **Core value:** Camera sees package → YOLO + QR identify class → robot delivers to correct bin → returns home → orchestrator logs event.
-**Current focus:** Phase 2 — Orchestrator + Dashboard
+**Current focus:** Phase 02.1 — vision-robot-tracking
 
 ## Current Position
 
-Phase: 2 (Orchestrator + Dashboard) — EXECUTING
-Plan: 5 of 5
-Status: Phase complete — ready for verification
+Phase: 02.1 (vision-robot-tracking) — EXECUTING
+Plan: 2 of 5
+Status: Ready to execute
 Last activity: 2026-04-14
 
 Progress: [░░░░░░░░░░] 0%
@@ -57,8 +57,13 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 02-orchestrator-dashboard P03 | 15 | 1 tasks | 3 files |
 | Phase 02-orchestrator-dashboard P04 | 15 | 2 tasks | 5 files |
 | Phase 02-orchestrator-dashboard P05 | 10 | 1 tasks | 1 files |
+| Phase 02.1-vision-robot-tracking P01 | 10 | 3 tasks | 5 files |
 
 ## Accumulated Context
+
+### Roadmap Evolution
+
+- Phase 02.1 inserted after Phase 2: vision-robot-tracking (URGENT) — user requested vision-based robot QR localization during Phase 2 discuss; replaces encoder-based positioning (Phase 1 D-09) with closed-loop vision control.
 
 ### Decisions
 
@@ -79,6 +84,8 @@ Recent decisions affecting current work:
 - [Phase 02-04]: ES5-compatible vanilla JS IIFE for broadest demo-day browser compatibility
 - [Phase 02-04]: TemplateResponse(request, name) positional API to avoid Starlette deprecation
 - [Phase 02-orchestrator-dashboard]: Added registry.reset() in client fixture for test isolation; used _Cfg helper to avoid importing Config for standalone tests; orchestrator-down test uses port 1 (always refused)
+- [Phase 02.1-01]: vision_confirmed/drift_px/vision_reason omitted from to_dict() when all None — preserves Phase 1 D-16 JSONL schema byte-identically
+- [Phase 02.1-01]: EventLogger.write uses keyword-only boundary so existing positional callers are unchanged
 
 ### Pending Todos
 
@@ -92,6 +99,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-14T15:55:51.749Z
-Stopped at: Completed 02-05-integration-tests-PLAN.md
+Last session: 2026-04-14T17:05:17.087Z
+Stopped at: Completed 02.1-01-config-eventlog-requirements-PLAN.md
 Resume file: None
