@@ -16,7 +16,7 @@ Requirements for the v1.0 milestone. Each maps to a roadmap phase.
 - [ ] **VIS-03**: pyzbar decodes QR from the cropped region and returns the package class string
 - [ ] **VIS-04**: Station reports "unknown package" when YOLO misses or QR decode fails (supports RF-12)
 - [x] **VIS-05**: Station detects a QR with payload `ROBOT` in each camera frame, separately from package QRs (A/B/C) (Phase 02.1, D-03..D-05)
-- [ ] **VIS-06**: `calibrate.py` captures and persists the expected ROBOT-QR pixel position for home and for each of the 3 bins (Phase 02.1, D-10..D-11)
+- [x] **VIS-06**: `calibrate.py` captures and persists the expected ROBOT-QR pixel position for home and for each of the 3 bins (Phase 02.1, D-10..D-11)
 - [x] **VIS-07**: After each motion command (`move_to_bin`, `return_home`), station compares observed ROBOT-QR pixel center to expected and records Euclidean pixel drift in the per-cycle JSONL entry (Phase 02.1, D-06..D-09, D-12, D-18)
 - [x] **VIS-08**: Vision confirmation is gated by config flag `vision_confirm_enabled` (default `false`); when disabled, Phase 1 behavior is preserved exactly (Phase 02.1, D-16)
 
@@ -106,7 +106,7 @@ Explicitly excluded from v1.0 to protect the 3-day deadline.
 | VIS-03 | Phase 1 | Pending |
 | VIS-04 | Phase 1 | Pending |
 | VIS-05 | Phase 02.1 | Complete |
-| VIS-06 | Phase 02.1 | Pending |
+| VIS-06 | Phase 02.1 | Complete |
 | VIS-07 | Phase 02.1 | Complete |
 | VIS-08 | Phase 02.1 | Complete |
 | ROB-01 | Phase 1 | Pending |
