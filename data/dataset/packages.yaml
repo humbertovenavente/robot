@@ -1,0 +1,14 @@
+# YOLOv8 dataset descriptor — 3-class package sorter
+# Labels produced by Roboflow or manual labeling from data/raw/<CLASS>/*.jpg
+# IMPORTANT (PITFALLS #2): split BEFORE augmenting. Roboflow: enable split first, augment second.
+
+path: ../data/dataset       # root (relative to the script's cwd when invoked from repo root)
+train: images/train
+val: images/val
+test: images/test            # optional; may be empty
+
+nc: 3
+names:
+  0: A
+  1: B
+  2: C
