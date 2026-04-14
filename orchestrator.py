@@ -34,7 +34,7 @@ app.mount("/static", StaticFiles(directory=str(REPO_ROOT / "static")), name="sta
 
 @app.get("/")
 async def dashboard_index(request: Request):
-    return _templates.TemplateResponse("dashboard.html", {"request": request})
+    return _templates.TemplateResponse(request, "dashboard.html")
 
 
 @dataclass
