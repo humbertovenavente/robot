@@ -38,8 +38,8 @@ Requirements for the v1.0 milestone. Each maps to a roadmap phase.
 
 ### Dashboard
 
-- [ ] **DSH-01**: Instructor dashboard (Jinja2 + vanilla JS + WebSocket) shows live status of every registered station (RNF-08)
-- [ ] **DSH-02**: Dashboard displays station state (free/processing/error/completed) and latest event per station
+- [x] **DSH-01**: Instructor dashboard (Jinja2 + vanilla JS + WebSocket) shows live status of every registered station (RNF-08)
+- [x] **DSH-02**: Dashboard displays station state (free/processing/error/completed) and latest event per station
 
 ### Error Handling
 
@@ -112,8 +112,8 @@ Explicitly excluded from v1.0 to protect the 3-day deadline.
 | ORC-02 | Phase 2 | Complete |
 | ORC-03 | Phase 2 | Complete |
 | ORC-04 | Phase 2 | Complete |
-| DSH-01 | Phase 2 | Pending |
-| DSH-02 | Phase 2 | Pending |
+| DSH-01 | Phase 2 | Complete |
+| DSH-02 | Phase 2 | Complete |
 | ERR-01 | Phase 3 | Pending |
 | ERR-02 | Phase 3 | Pending |
 | ERR-03 | Phase 3 | Pending |
