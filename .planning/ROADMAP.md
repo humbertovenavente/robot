@@ -81,7 +81,7 @@ Plans:
 
 Plans:
 - [x] 03-01-PLAN.md — station.py error handling: _halted flag, watchdog timer, _halt() helper, unknown-package free reset (ERR-01, ERR-02, ERR-03)
-- [ ] 03-02-PLAN.md — Error-handling test suite: 5 pytest tests for ERR-01/02/03 behaviors + regression (ERR-01, ERR-02, ERR-03)
+- [x] 03-02-PLAN.md — Error-handling test suite: 5 pytest tests for ERR-01/02/03 behaviors + regression (ERR-01, ERR-02, ERR-03)
 - [x] 03-03-PLAN.md — DEMO_CHECKLIST.md + human checkpoint: pre-demo operator runbook + demo execution (DEM-01, DEM-02, DEM-03)
 
 ## Progress
