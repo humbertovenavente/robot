@@ -24,6 +24,23 @@ log_dir: logs
 # Format: ws://<host>:<port>/ws  (no role query — ws_client adds ?role=station)
 orchestrator_url: ws://127.0.0.1:8000/ws
 
+# CAM-01: camera-triggered approach — bug walks to QR scan point when camera opens
+# Set qr_approach_enabled: true to activate. qr_approach_encoder_target: null = use home position.
+qr_approach_enabled: false
+qr_approach_encoder_target: null
+
+# NAV-01: QR visual navigation (camera en robot, run: python web_nav.py)
+# nav_robot: stub (simulado) | nxt (brick LEGO NXT conectado por USB)
+nav_robot: nxt
+nav_arrived_area_pct: 0.15   # QR ocupa 15% del frame → llegó
+nav_center_tol_px: 60        # px tolerancia al centro antes de girar
+nav_drive_speed: 95          # velocidad adelante 0-100
+nav_turn_speed: 85           # velocidad de giro 0-100
+nav_motor_left_port: A       # puerto motor izquierdo (A/B/C)
+nav_motor_right_port: C      # puerto motor derecho  (A/B/C)
+nav_invert_left: false       # true si la rueda izquierda gira al revés
+nav_invert_right: false      # true si la rueda derecha gira al revés
+
 # Obstacle detection — OBS-01 (set obstacle_detection_enabled: true to activate)
 # Uses yolov8n.pt (COCO, already in repo root) to detect objects in the robot's path.
 # obstacle_classes: []           # empty = all 80 COCO classes count as obstacles

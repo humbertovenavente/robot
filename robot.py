@@ -31,6 +31,10 @@ class RobotInterface(Protocol):
         """Current encoder reading in degrees. Used by calibration and diagnostics."""
         ...
 
+    def move_to_qr_point(self) -> None:
+        """Drive to the QR scan position when the station camera is first recognized. (CAM-01)"""
+        ...
+
     def shutdown(self) -> None:
         """Release hardware resources (motor brake, close connection). Safe to call multiple times."""
         ...
@@ -71,6 +75,13 @@ class StubRobot:
     def return_home(self) -> None:
         log.info("StubRobot: return_home")
         self._simulate_travel(self.config.home_encoder_target)
+
+    def move_to_qr_point(self) -> None:
+        target = self.config.qr_approach_encoder_target
+        if target is None:
+            target = self.config.home_encoder_target
+        log.info("StubRobot: move_to_qr_point -> %d°", target)
+        self._simulate_travel(target)
 
     def get_current_position(self) -> int:
         return self._current_position

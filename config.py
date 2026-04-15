@@ -51,6 +51,21 @@ class Config(BaseModel):
     obstacle_block_frames: int = 3   # consecutive blocked frames required to trigger halt
     obstacle_clear_frames: int = 4   # consecutive clear frames required to resume
 
+    # CAM-01: camera-triggered approach — bug walks to QR scan point on camera open
+    qr_approach_enabled: bool = False          # True = robot moves to QR point when camera opens
+    qr_approach_encoder_target: Optional[int] = None  # encoder degrees; None = home_encoder_target
+
+    # NAV-01: QR visual navigation (camera on robot, web_nav.py)
+    nav_robot: Literal["stub", "nxt"] = "stub"  # "nxt" = real LEGO NXT brick
+    nav_arrived_area_pct: float = 0.15   # fraction of frame → considered arrived at QR
+    nav_center_tol_px: int = 40          # horizontal dead-band (px) before steering correction
+    nav_drive_speed: int = 50            # forward speed 0-100
+    nav_turn_speed: int = 35             # steering speed 0-100
+    nav_motor_left_port: str = "B"       # NXT motor port for left wheel (A/B/C)
+    nav_motor_right_port: str = "C"      # NXT motor port for right wheel (A/B/C)
+    nav_invert_left: bool = False        # flip left motor direction if wired backwards
+    nav_invert_right: bool = False       # flip right motor direction if wired backwards
+
     # Phase 02.1 — vision-confirm fields (D-11, D-13, D-16)
     vision_confirm_enabled: bool = False  # D-16: default off; Phase 1 behavior preserved when False
     vision_confirm_tolerance_px: int = 30  # D-13: Euclidean pixel drift threshold

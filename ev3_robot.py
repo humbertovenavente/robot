@@ -18,5 +18,6 @@ class EV3Robot:
     def move_to_bin(self, bin_index: int) -> None: raise NotImplementedError
     def deposit(self) -> None: raise NotImplementedError
     def return_home(self) -> None: raise NotImplementedError
+    def move_to_qr_point(self) -> None: raise NotImplementedError
     def get_current_position(self) -> int: raise NotImplementedError
     def shutdown(self) -> None: raise NotImplementedError

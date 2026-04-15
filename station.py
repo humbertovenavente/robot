@@ -262,6 +262,20 @@ class Station:
             self._set_status("error")
             return
 
+        # CAM-01: camera recognized — bug walks to QR scan point
+        if getattr(self.config, "qr_approach_enabled", False):
+            log.info(
+                "Camera %d recognized — moving bug to QR point (%s°)",
+                self.config.camera_index,
+                self.config.qr_approach_encoder_target
+                if self.config.qr_approach_encoder_target is not None
+                else self.config.home_encoder_target,
+            )
+            try:
+                self.robot.move_to_qr_point()
+            except Exception as e:
+                log.error("move_to_qr_point failed: %s — continuing", e)
+
         iterations = 0
         try:
             while not self._stop:
