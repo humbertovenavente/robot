@@ -1,5 +1,5 @@
 station_id: station-1
-camera_index: 0
+camera_index: 1
 yolo_model_path: models/best.pt
 yolo_confidence_threshold: 0.40
 yolo_imgsz: 640
