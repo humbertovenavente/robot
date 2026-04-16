@@ -112,6 +112,13 @@ class StationsRegistry:
     def get_heading_offset(self) -> float:
         return float(self._data.get("bot_heading_offset", 0.0))
 
+    def set_claw_offset_px(self, px: int) -> None:
+        self._data["claw_offset_px"] = px
+        self.save()
+
+    def get_claw_offset_px(self) -> int:
+        return int(self._data.get("claw_offset_px", 0))
+
 
 # ── mission controller ────────────────────────────────────────────────────────
 
@@ -464,6 +471,31 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
     </div>
   </div>
   <div id="setup-status" class="setup-status">Loading station registry…</div>
+
+  <!-- Scale calibration -->
+  <div class="section" style="margin-top:14px;max-width:520px">
+    <h3>Scale calibration (claw offset)</h3>
+    <p style="font-size:.76rem;color:#666;margin-bottom:10px">
+      Place any QR code flat on the floor. Enter its printed size and the claw reach, then hit
+      <b>Measure</b>. The system reads the QR pixel size to compute px/cm automatically.
+    </p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+      <label style="font-size:.78rem;color:#888;display:flex;flex-direction:column;gap:3px">
+        QR physical size (cm)
+        <input id="cal-qr-size" type="number" value="8" min="1" max="50" step="0.5"
+          style="width:100px;padding:5px 8px;border-radius:6px;border:1px solid #333;
+                 background:#111;color:#e8e8e8;font-size:.85rem">
+      </label>
+      <label style="font-size:.78rem;color:#888;display:flex;flex-direction:column;gap:3px">
+        Claw reach (cm)
+        <input id="cal-claw-reach" type="number" value="11" min="1" max="50" step="0.5"
+          style="width:100px;padding:5px 8px;border-radius:6px;border:1px solid #333;
+                 background:#111;color:#e8e8e8;font-size:.85rem">
+      </label>
+      <button class="btn-primary" onclick="calibrateScale()">Measure</button>
+    </div>
+    <div id="cal-result" style="margin-top:8px;font-size:.78rem;color:#555;min-height:16px"></div>
+  </div>
 </div>
 
 <!-- ─── MISSION TAB ───────────────────────────────────────────────────────── -->
@@ -1008,6 +1040,30 @@ function closeDirModal() {
   _dirArrow = null; _dirQrInfo = null; _dirImgEl = null;
 }
 
+// ── scale calibration ─────────────────────────────────────────────────────────
+async function calibrateScale() {
+  const qrSize   = parseFloat(document.getElementById('cal-qr-size').value)   || 8;
+  const clawReach = parseFloat(document.getElementById('cal-claw-reach').value) || 11;
+  const res = document.getElementById('cal-result');
+  res.style.color = '#fb923c';
+  res.textContent = 'Measuring…';
+  const r = await fetch('/api/setup/calibrate-scale', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({qr_size_cm: qrSize, claw_reach_cm: clawReach}),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    res.style.color = '#4ade80';
+    res.textContent = `✓ QR "${d.qr_payload}" = ${d.qr_size_px}px → `
+      + `${d.px_per_cm} px/cm → claw offset = ${d.claw_offset_px}px`;
+    addLog(`Scale calibrated: ${d.px_per_cm}px/cm  claw offset=${d.claw_offset_px}px`);
+  } else {
+    res.style.color = '#ef4444';
+    res.textContent = '✗ ' + d.reason;
+    addLog('Calibration failed: ' + d.reason);
+  }
+}
+
 // Bootstrap
 (async () => {
   try {
@@ -1287,6 +1343,55 @@ async def api_bot_direction(body: dict):
     return {"ok": True, "offset_deg": round(math.degrees(offset), 1), "offset_rad": offset}
 
 
+@app.post("/api/setup/calibrate-scale")
+async def api_calibrate_scale(body: dict):
+    """Measure pixel size of any visible QR to derive px/cm scale.
+
+    body: {qr_size_cm: float, claw_reach_cm: float}
+    Detects the largest QR in frame, measures its pixel size (average of width+height),
+    computes px_per_cm, then sets claw_offset_px = round(claw_reach_cm * px_per_cm).
+    """
+    import numpy as np
+    qr_size_cm   = float(body.get("qr_size_cm",   8.0))
+    claw_reach_cm = float(body.get("claw_reach_cm", 11.0))
+    if qr_size_cm <= 0:
+        return {"ok": False, "reason": "qr_size_cm must be > 0"}
+    if _navigator is None:
+        return {"ok": False, "reason": "navigator not running"}
+    with _navigator._frame_lock:
+        frame = _navigator._raw_frame.copy() if _navigator._raw_frame is not None else None
+    if frame is None:
+        return {"ok": False, "reason": "no camera frame yet"}
+
+    items = _detect_overhead(frame)
+    if not items:
+        return {"ok": False, "reason": "no QR codes visible in frame — place one and retry"}
+
+    # Pick the largest QR by bounding-box area
+    def _qr_size_px(item):
+        c = item["corners"]
+        w = (np.linalg.norm(c[1] - c[0]) + np.linalg.norm(c[2] - c[3])) / 2
+        h = (np.linalg.norm(c[3] - c[0]) + np.linalg.norm(c[2] - c[1])) / 2
+        return (w + h) / 2   # average side length in pixels
+
+    best      = max(items, key=_qr_size_px)
+    size_px   = _qr_size_px(best)
+    px_per_cm = size_px / qr_size_cm
+    claw_px   = round(claw_reach_cm * px_per_cm)
+
+    _registry.set_claw_offset_px(claw_px)
+    _navigator._claw_offset_px = claw_px
+    log.info("Scale calibration: QR=%.1fpx / %.1fcm → %.2fpx/cm  claw=%dpx",
+             size_px, qr_size_cm, px_per_cm, claw_px)
+    return {
+        "ok":          True,
+        "qr_payload":  best["payload"],
+        "qr_size_px":  round(size_px, 1),
+        "px_per_cm":   round(px_per_cm, 2),
+        "claw_offset_px": claw_px,
+    }
+
+
 @app.post("/api/setup/generate-base")
 async def api_generate_base():
     """Generate base station QR PNG in qr_codes/ and auto-register it."""
@@ -1352,14 +1457,17 @@ _app_config = None
 
 
 def _apply_bot_qr() -> None:
-    """Push current bot QR + heading offset from registry into the navigator."""
+    """Push current bot QR, heading offset, and claw offset from registry into the navigator."""
     if _navigator and _registry:
-        bot_qr = _registry.get("bot")
-        offset  = _registry.get_heading_offset()
+        bot_qr        = _registry.get("bot")
+        offset        = _registry.get_heading_offset()
+        claw_offset   = _registry.get_claw_offset_px()
         _navigator.set_bot_qr(bot_qr)
         _navigator._heading_offset = offset
-        log.info("Navigator bot_qr=%s heading_offset=%.1f°",
-                 bot_qr or "None", math.degrees(offset))
+        if claw_offset > 0:
+            _navigator._claw_offset_px = claw_offset
+        log.info("Navigator bot_qr=%s heading_offset=%.1f° claw_offset=%dpx",
+                 bot_qr or "None", math.degrees(offset), _navigator._claw_offset_px)
 
 
 @app.on_event("startup")
