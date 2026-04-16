@@ -22,6 +22,12 @@ _CMD_THROTTLE_MS = 180
 # How often to send keep_alive to prevent NXT auto-sleep (seconds)
 _KEEPALIVE_INTERVAL_S = 8
 
+# Claw (Motor B) — flip signs if your claw moves the wrong way
+_CLAW_PORT        = "B"
+_CLAW_OPEN_POWER  =  70   # positive = open
+_CLAW_CLOSE_POWER = -70   # negative = close
+_CLAW_DURATION_S  =  0.6  # seconds to run motor before braking
+
 
 class NXTDrive(DriveInterface):
     """Sends move/steer/stop commands to LEGO NXT motors via nxt-python v3."""
@@ -141,24 +147,16 @@ class NXTDrive(DriveInterface):
                 log.error("NXTDrive %s: %s", label, exc)
                 self._brick = None   # forzar reconexión
 
-    def move_forward(self, speed: int = DEFAULT_DRIVE_SPEED) -> None:
+    def drive(self, left: int, right: int) -> None:
+        """Set left and right wheel speeds independently (-100..100)."""
         if not self._ensure_connected():
             log.warning("NXTDrive: brick no conectado")
             return
-        self._send(self._p(speed, self._invert_left),
-                   self._p(speed, self._invert_right), "adelante")
-
-    def steer(self, turn_rate: int) -> None:
-        if not self._ensure_connected():
-            return
-        p = abs(turn_rate)
-        if turn_rate > 0:   # QR a la derecha → girar derecha
-            pl = self._p(p, self._invert_left)
-            pr = -self._p(p, self._invert_right)
-        else:               # QR a la izquierda → girar izquierda
-            pl = -self._p(p, self._invert_left)
-            pr =  self._p(p, self._invert_right)
-        self._send(pl, pr, "steer")
+        self._send(
+            self._p(left,  self._invert_left),
+            self._p(right, self._invert_right),
+            f"drive L={left} R={right}",
+        )
 
     def stop_motors(self) -> None:
         if not self._ensure_connected():
@@ -178,6 +176,33 @@ class NXTDrive(DriveInterface):
                 log.error("NXTDrive stop: %s", exc)
                 self._brick = None
 
+
+    # ── claw (Motor B) ──────────────────────────────────────────────────────────
+
+    def open_claw(self) -> None:
+        """Run Motor B to open claw. Flip _CLAW_OPEN_POWER sign if direction is wrong."""
+        self._run_claw(_CLAW_OPEN_POWER, "open")
+
+    def close_claw(self) -> None:
+        self._run_claw(_CLAW_CLOSE_POWER, "close")
+
+    def _run_claw(self, power: int, label: str) -> None:
+        if not self._ensure_connected():
+            log.warning("NXTDrive: brick not connected — skipping claw %s", label)
+            return
+        with self._lock:
+            try:
+                self._set_output(_CLAW_PORT, power)
+            except Exception as exc:
+                log.error("NXTDrive claw %s start: %s", label, exc)
+                return
+        time.sleep(_CLAW_DURATION_S)
+        with self._lock:
+            try:
+                self._set_output(_CLAW_PORT, 0, brake=True)
+                log.info("NXTDrive: claw %s done", label)
+            except Exception as exc:
+                log.error("NXTDrive claw %s stop: %s", label, exc)
 
     def disconnect(self) -> None:
         """Cerrar conexión USB limpiamente para permitir reconexión posterior."""
