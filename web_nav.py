@@ -572,27 +572,57 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
 
 <!-- ─── TESTING TAB ──────────────────────────────────────────────────────── -->
 <div id="tab-test" class="tab-pane">
-  <div style="max-width:600px">
-    <p style="color:#666;font-size:.82rem;margin-bottom:16px">
-      Direct navigation — bypasses mission flow. Bot drives to the selected station QR and stops when arrived.
-      Mission must be <b>idle</b> before using.
-    </p>
-
-    <div class="section" style="margin-bottom:12px">
-      <h3>Go to station</h3>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px" id="test-goto-grid">
-        <!-- injected by JS -->
+  <div style="display:grid;grid-template-columns:1fr 340px;gap:16px">
+    <!-- Left: camera + selector -->
+    <div>
+      <div class="camera-main"><img src="/stream" alt="camera feed"></div>
+      <div class="section" style="margin-top:10px">
+        <h3>Camera input</h3>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+          <select id="cam-select"
+            style="flex:1;padding:6px 10px;border-radius:6px;border:1px solid #333;
+                   background:#111;color:#e8e8e8;font-size:.82rem">
+            <option value="">Loading…</option>
+          </select>
+          <button class="btn-neutral btn-sm" onclick="loadCameras()" title="Refresh device list">↺</button>
+          <button class="btn-primary btn-sm" id="cam-switch-btn" onclick="switchCamera()">Use</button>
+        </div>
+        <div id="cam-status" style="margin-top:6px;font-size:.75rem;color:#555;min-height:14px"></div>
       </div>
     </div>
 
-    <div class="section" style="margin-bottom:12px">
-      <h3>Nav status</h3>
-      <div class="stat-row"><span class="stat-label">Status</span><span class="stat-val" id="t-nav">—</span></div>
-      <div class="stat-row"><span class="stat-label">Target QR</span><span class="stat-val" id="t-target">—</span></div>
-      <div class="stat-row"><span class="stat-label">Proximity</span><span class="stat-val" id="t-area">—</span></div>
-    </div>
+    <!-- Right: controls -->
+    <div>
+      <p style="color:#666;font-size:.82rem;margin-bottom:12px">
+        Direct navigation — bypasses mission flow. Mission must be <b>idle</b>.
+      </p>
 
-    <button class="btn-danger" onclick="testStop()">Stop motors</button>
+      <div class="section" style="margin-bottom:12px">
+        <h3>Go to station</h3>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px" id="test-goto-grid">
+          <!-- injected by JS -->
+        </div>
+      </div>
+
+      <div class="section" style="margin-bottom:12px">
+        <h3>Go to visible QR</h3>
+        <p style="font-size:.75rem;color:#555;margin-bottom:8px">
+          Navigate directly to any QR code currently in the camera frame.
+        </p>
+        <div id="test-qr-grid" style="display:flex;flex-wrap:wrap;gap:8px">
+          <!-- injected by JS -->
+        </div>
+      </div>
+
+      <div class="section" style="margin-bottom:12px">
+        <h3>Nav status</h3>
+        <div class="stat-row"><span class="stat-label">Status</span><span class="stat-val" id="t-nav">—</span></div>
+        <div class="stat-row"><span class="stat-label">Target QR</span><span class="stat-val" id="t-target">—</span></div>
+        <div class="stat-row"><span class="stat-label">Proximity</span><span class="stat-val" id="t-area">—</span></div>
+      </div>
+
+      <button class="btn-danger" onclick="testStop()">Stop motors</button>
+    </div>
   </div>
 </div>
 
@@ -639,6 +669,7 @@ function showTab(id) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + id).classList.add('active');
   event.target.classList.add('active');
+  if (id === 'test') loadCameras();
 }
 
 // ── log ───────────────────────────────────────────────────────────────────────
@@ -737,6 +768,7 @@ function applyState(s) {
 
   renderStations();
   renderTestButtons();
+  renderTestQRButtons();
 }
 
 // ── setup: station list ───────────────────────────────────────────────────────
@@ -837,6 +869,62 @@ async function clearStation(key) {
   }
 }
 
+// ── camera selector ───────────────────────────────────────────────────────────
+async function loadCameras() {
+  const sel = document.getElementById('cam-select');
+  const status = document.getElementById('cam-status');
+  try {
+    const d = await (await fetch('/api/camera/list')).json();
+    sel.innerHTML = '';
+    if (!d.devices || !d.devices.length) {
+      sel.innerHTML = '<option value="">No devices found</option>';
+      return;
+    }
+    d.devices.forEach(dev => {
+      const opt = document.createElement('option');
+      opt.value = dev.index;
+      opt.textContent = `[${dev.index}] ${dev.label}`;
+      if (dev.index === d.current) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    status.textContent = `Active: index ${d.current}`;
+    status.style.color = '#4ade80';
+  } catch(e) {
+    status.textContent = 'Failed to load devices';
+    status.style.color = '#ef4444';
+  }
+}
+
+async function switchCamera() {
+  const sel = document.getElementById('cam-select');
+  const status = document.getElementById('cam-status');
+  const btn = document.getElementById('cam-switch-btn');
+  const idx = parseInt(sel.value, 10);
+  if (isNaN(idx)) return;
+  btn.disabled = true;
+  status.textContent = 'Switching…';
+  status.style.color = '#fb923c';
+  try {
+    const r = await fetch('/api/camera/switch', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({index: idx})
+    });
+    const d = await r.json();
+    if (d.ok) {
+      status.textContent = `✓ Switched to index ${idx}`;
+      status.style.color = '#4ade80';
+      addLog(`Camera switched to index ${idx}`);
+    } else {
+      status.textContent = '✗ ' + d.reason;
+      status.style.color = '#ef4444';
+    }
+  } catch(e) {
+    status.textContent = 'Request failed';
+    status.style.color = '#ef4444';
+  }
+  btn.disabled = false;
+}
+
 // ── testing actions ───────────────────────────────────────────────────────────
 function renderTestButtons() {
   const grid = document.getElementById('test-goto-grid');
@@ -851,6 +939,35 @@ function renderTestButtons() {
     if (qr) btn.onclick = () => testGoto(key);
     grid.appendChild(btn);
   });
+}
+
+function renderTestQRButtons() {
+  const grid = document.getElementById('test-qr-grid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  const visible = allQrPayloads.filter(Boolean);
+  if (!visible.length) {
+    grid.innerHTML = '<span style="color:#555;font-size:.8rem">No QR codes visible in frame</span>';
+    return;
+  }
+  visible.forEach(qr => {
+    const btn = document.createElement('button');
+    btn.className = 'btn-warn';
+    btn.textContent = qr.length > 22 ? qr.slice(0, 20) + '…' : qr;
+    btn.title = qr;
+    btn.disabled = missionState !== 'idle';
+    btn.onclick = () => testGotoQR(qr);
+    grid.appendChild(btn);
+  });
+}
+
+async function testGotoQR(qr) {
+  const r = await fetch('/api/test/goto-qr', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({qr})
+  });
+  const d = await r.json();
+  addLog(d.ok ? `Testing: navigating to QR "${qr}"` : 'Error: ' + d.reason);
 }
 
 async function testGoto(station) {
@@ -1423,6 +1540,24 @@ async def api_test_goto(body: dict):
     return {"ok": True}
 
 
+@app.post("/api/test/goto-qr")
+async def api_test_goto_qr(body: dict):
+    global _test_target
+    if _mission and _mission.state != "idle":
+        return {"ok": False, "reason": "mission running — abort it first"}
+    qr = body.get("qr", "").strip()
+    if not qr:
+        return {"ok": False, "reason": "qr required"}
+    if _navigator is None:
+        return {"ok": False, "reason": "navigator not running"}
+    _test_target = qr
+    _navigator.set_target(qr)
+    _navigator.set_navigating(True)
+    log.info("Test: navigating to QR=%s", qr)
+    asyncio.create_task(_broadcast_state())
+    return {"ok": True}
+
+
 @app.post("/api/test/stop")
 async def api_test_stop():
     global _test_target
@@ -1431,6 +1566,59 @@ async def api_test_stop():
         _navigator.set_navigating(False)
     asyncio.create_task(_broadcast_state())
     return {"ok": True}
+
+
+@app.get("/api/camera/list")
+async def api_camera_list():
+    """List available /dev/video* capture devices with labels from v4l2-ctl."""
+    import glob as _glob, subprocess
+    devices = []
+    for path in sorted(_glob.glob("/dev/video*")):
+        try:
+            idx = int(path.replace("/dev/video", ""))
+        except ValueError:
+            continue
+        label = path
+        try:
+            result = subprocess.run(
+                ["v4l2-ctl", f"--device={path}", "--info"],
+                capture_output=True, text=True, timeout=2,
+            )
+            for line in result.stdout.splitlines():
+                if "Card type" in line:
+                    label = line.split(":", 1)[1].strip()
+                    break
+        except Exception:
+            pass
+        devices.append({"index": idx, "path": path, "label": label})
+    current = getattr(_app_config, "camera_index", 0) if _app_config else 0
+    return {"devices": devices, "current": current}
+
+
+@app.post("/api/camera/switch")
+async def api_camera_switch(body: dict):
+    """Switch active camera by restarting the navigator with a new index."""
+    global _navigator, _nav_thread
+    if _mission and _mission.state != "idle":
+        return {"ok": False, "reason": "mission running — abort it first"}
+    idx = body.get("index")
+    if idx is None:
+        return {"ok": False, "reason": "index required"}
+    idx = int(idx)
+    if _navigator:
+        _navigator.stop()
+    if _nav_thread:
+        _nav_thread.join(timeout=3.0)
+    _app_config.camera_index = idx
+    _navigator = build_navigator(_app_config, on_state_change=_on_state_change)
+    _apply_bot_qr()
+    if _mission:
+        _mission._nav = _navigator
+    _nav_thread = threading.Thread(target=_navigator.run, daemon=True, name="navigator")
+    _nav_thread.start()
+    log.info("Camera switched to index %d", idx)
+    asyncio.create_task(_broadcast_state())
+    return {"ok": True, "index": idx}
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
