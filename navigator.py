@@ -262,10 +262,11 @@ class QRNavigator:
         # Overhead extras: bot heading arrow + line to target
         if st.bot_pos and st.bot_heading is not None:
             bx, by = int(st.bot_pos[0]), int(st.bot_pos[1])
-            arrow_len = 40
+            arrow_len = 60
             ax = int(bx + arrow_len * math.cos(st.bot_heading))
             ay = int(by + arrow_len * math.sin(st.bot_heading))
-            cv2.arrowedLine(frame, (bx, by), (ax, ay), (255, 100, 0), 2, tipLength=0.3)
+            cv2.arrowedLine(frame, (bx, by), (ax, ay), (255, 100, 0), 2, tipLength=0.25)
+            cv2.circle(frame, (ax, ay), 8, (255, 80, 0), -1)   # blue forward dot (BGR)
             if st.target_pos:
                 tx, ty = int(st.target_pos[0]), int(st.target_pos[1])
                 cv2.line(frame, (bx, by), (tx, ty), (0, 220, 220), 1)
@@ -384,7 +385,7 @@ class QRNavigator:
         target = next((i for i in items if i["payload"] == self._target_qr), None) \
                  if self._target_qr else None
 
-        if not self._navigating or bot is None:
+        if bot is None:
             self._drive.stop_motors()
             self._set_state(
                 status="idle" if not self._navigating else "searching",
@@ -398,6 +399,18 @@ class QRNavigator:
 
         bx, by   = bot["cx"], bot["cy"]
         bot_hdg  = _qr_heading(bot["corners"], self._heading_offset)
+
+        if not self._navigating:
+            self._drive.stop_motors()
+            self._set_state(
+                status="idle",
+                qr_payload=None, qr_cx=int(bx), qr_area_pct=None,
+                frame_w=fw, frame_h=fh,
+                all_qr_payloads=all_payloads, all_qr_rects=all_rects,
+                bot_pos=(bx, by), bot_heading=bot_hdg,
+                target_pos=None, dist_to_target=None, heading_error=None,
+            )
+            return
 
         if target is None:
             # Can see bot but not target — stop and wait

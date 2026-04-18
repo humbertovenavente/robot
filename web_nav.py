@@ -504,6 +504,21 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
     </div>
     <div id="cal-result" style="margin-top:8px;font-size:.78rem;color:#555;min-height:16px"></div>
   </div>
+
+  <!-- Bot forward direction -->
+  <div class="section" style="margin-top:14px;max-width:520px">
+    <h3>Bot forward direction</h3>
+    <p style="font-size:.76rem;color:#666;margin-bottom:10px">
+      Place the bot so its <b>Bot QR</b> is visible in the camera, then draw an arrow
+      pointing toward the <b>front of the robot</b>. Required for overhead navigation.
+    </p>
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <button class="btn-warn" onclick="openDirModal()">Draw forward arrow</button>
+      <span style="font-size:.8rem;color:#666">
+        Current offset: <span id="setup-heading-offset" style="color:#e8e8e8;font-family:monospace">—</span>
+      </span>
+    </div>
+  </div>
 </div>
 
 <!-- ─── MISSION TAB ───────────────────────────────────────────────────────── -->
@@ -776,7 +791,7 @@ function renderStations() {
 
     let extra = '';
     if (key === 'bot' && qr) {
-      extra = `<button class="btn-warn btn-sm" onclick="openDirModal()" title="Draw arrow to set forward direction">↗ Direction</button>`;
+      extra = '';
     }
     if (key === 'base') {
       extra = `<button class="btn-neutral btn-sm" onclick="generateBaseQR()" title="Generate and print base QR">⚙ Generate</button>`;
@@ -1125,10 +1140,16 @@ async function confirmDirection() {
   const d = await r.json();
   if (d.ok) {
     addLog(`Bot forward direction saved (offset ${d.offset_deg.toFixed(1)}°)`);
+    _applyHeadingOffset(d.offset_deg);
     closeDirModal();
   } else {
     document.getElementById('dir-status').textContent = 'Error: ' + d.reason;
   }
+}
+
+function _applyHeadingOffset(deg) {
+  const el = document.getElementById('setup-heading-offset');
+  if (el) el.textContent = deg != null ? deg.toFixed(1) + '°' : '—';
 }
 
 function closeDirModal() {
@@ -1167,6 +1188,11 @@ async function calibrateScale() {
     applyState(s);
   } catch(_) {}
   loadCameras();
+  try {
+    const info = await (await fetch('/api/setup/bot-qr-info')).json();
+    if (info.current_offset != null)
+      _applyHeadingOffset(parseFloat((info.current_offset * 180 / Math.PI).toFixed(1)));
+  } catch(_) {}
   connectWS();
 })();
 </script>

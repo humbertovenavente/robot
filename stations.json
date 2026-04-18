@@ -1,6 +1,7 @@
 {
-  "base": "ROBOT",
   "station_1": "A",
   "station_2": "B",
-  "station_3": "C"
+  "station_3": "C",
+  "bot": "Robot",
+  "bot_heading_offset": -1.5247201769304266
 }
