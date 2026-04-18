@@ -446,8 +446,16 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
     background:#2d0a0a;color:#ef4444">
     <span id="nxt-dot" class="dot off"></span>NXT
   </span>
-  <span style="margin-left:auto;font-size:.75rem;color:#444;display:flex;align-items:center">
-    <span id="ws-dot" class="dot off"></span>live
+  <span style="margin-left:auto;display:flex;align-items:center;gap:8px">
+    <select id="cam-select"
+      style="padding:4px 8px;border-radius:6px;border:1px solid #374151;
+             background:#1f2937;color:#e8e8e8;font-size:.75rem;cursor:pointer"
+      onchange="switchCamera()">
+      <option value="">Camera…</option>
+    </select>
+    <span style="font-size:.75rem;color:#444;display:flex;align-items:center">
+      <span id="ws-dot" class="dot off"></span>live
+    </span>
   </span>
 </header>
 
@@ -573,22 +581,9 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
 <!-- ─── TESTING TAB ──────────────────────────────────────────────────────── -->
 <div id="tab-test" class="tab-pane">
   <div style="display:grid;grid-template-columns:1fr 340px;gap:16px">
-    <!-- Left: camera + selector -->
+    <!-- Left: camera feed -->
     <div>
       <div class="camera-main"><img src="/stream" alt="camera feed"></div>
-      <div class="section" style="margin-top:10px">
-        <h3>Camera input</h3>
-        <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
-          <select id="cam-select"
-            style="flex:1;padding:6px 10px;border-radius:6px;border:1px solid #333;
-                   background:#111;color:#e8e8e8;font-size:.82rem">
-            <option value="">Loading…</option>
-          </select>
-          <button class="btn-neutral btn-sm" onclick="loadCameras()" title="Refresh device list">↺</button>
-          <button class="btn-primary btn-sm" id="cam-switch-btn" onclick="switchCamera()">Use</button>
-        </div>
-        <div id="cam-status" style="margin-top:6px;font-size:.75rem;color:#555;min-height:14px"></div>
-      </div>
     </div>
 
     <!-- Right: controls -->
@@ -669,7 +664,6 @@ function showTab(id) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + id).classList.add('active');
   event.target.classList.add('active');
-  if (id === 'test') loadCameras();
 }
 
 // ── log ───────────────────────────────────────────────────────────────────────
@@ -872,7 +866,6 @@ async function clearStation(key) {
 // ── camera selector ───────────────────────────────────────────────────────────
 async function loadCameras() {
   const sel = document.getElementById('cam-select');
-  const status = document.getElementById('cam-status');
   try {
     const d = await (await fetch('/api/camera/list')).json();
     sel.innerHTML = '';
@@ -887,42 +880,28 @@ async function loadCameras() {
       if (dev.index === d.current) opt.selected = true;
       sel.appendChild(opt);
     });
-    status.textContent = `Active: index ${d.current}`;
-    status.style.color = '#4ade80';
   } catch(e) {
-    status.textContent = 'Failed to load devices';
-    status.style.color = '#ef4444';
+    sel.innerHTML = '<option value="">Error loading</option>';
   }
 }
 
 async function switchCamera() {
   const sel = document.getElementById('cam-select');
-  const status = document.getElementById('cam-status');
-  const btn = document.getElementById('cam-switch-btn');
   const idx = parseInt(sel.value, 10);
   if (isNaN(idx)) return;
-  btn.disabled = true;
-  status.textContent = 'Switching…';
-  status.style.color = '#fb923c';
+  sel.disabled = true;
   try {
     const r = await fetch('/api/camera/switch', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({index: idx})
     });
     const d = await r.json();
-    if (d.ok) {
-      status.textContent = `✓ Switched to index ${idx}`;
-      status.style.color = '#4ade80';
-      addLog(`Camera switched to index ${idx}`);
-    } else {
-      status.textContent = '✗ ' + d.reason;
-      status.style.color = '#ef4444';
-    }
+    addLog(d.ok ? `Camera switched to index ${idx}` : 'Camera switch failed: ' + d.reason);
+    if (!d.ok) await loadCameras();
   } catch(e) {
-    status.textContent = 'Request failed';
-    status.style.color = '#ef4444';
+    addLog('Camera switch request failed');
   }
-  btn.disabled = false;
+  sel.disabled = false;
 }
 
 // ── testing actions ───────────────────────────────────────────────────────────
@@ -1187,6 +1166,7 @@ async function calibrateScale() {
     const s = await (await fetch('/api/status')).json();
     applyState(s);
   } catch(_) {}
+  loadCameras();
   connectWS();
 })();
 </script>
