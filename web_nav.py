@@ -47,7 +47,8 @@ QR_CODES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qr_code
 
 log = logging.getLogger(__name__)
 
-STATIONS_FILE = os.path.join(os.path.dirname(__file__), "stations.json")
+STATIONS_FILE  = os.path.join(os.path.dirname(__file__), "stations.json")
+BG_FRAME_PATH  = os.path.join(os.path.dirname(__file__), "bg_frame.jpg")
 STATION_KEYS  = ["bot", "base", "station_1", "station_2", "station_3"]
 STATION_LABELS = {
     "bot":       "Bot (top marker)",
@@ -118,6 +119,20 @@ class StationsRegistry:
 
     def get_claw_offset_px(self) -> int:
         return int(self._data.get("claw_offset_px", 0))
+
+    def set_base_parking_offset(self, dx: float, dy: float) -> None:
+        self._data["base_parking_offset"] = {"dx": round(dx, 1), "dy": round(dy, 1)}
+        self.save()
+
+    def get_base_parking_offset(self) -> Optional[tuple]:
+        off = self._data.get("base_parking_offset")
+        if off and (off.get("dx") or off.get("dy")):
+            return float(off["dx"]), float(off["dy"])
+        return None
+
+    def clear_base_parking_offset(self) -> None:
+        self._data.pop("base_parking_offset", None)
+        self.save()
 
 
 # ── mission controller ────────────────────────────────────────────────────────
@@ -298,8 +313,9 @@ def _make_payload() -> str:
         "nxt_connected":  _nxt_connected(),
         "package_qr":     _mission.package_qr if _mission else None,
         "destination":    _mission.destination if _mission else None,
-        "stations":       _registry.all() if _registry else {},
-        "test_target":    _test_target,
+        "stations":          _registry.all() if _registry else {},
+        "test_target":       _test_target,
+        "full_station_qrs":  list(s.full_station_qrs) if s else [],
     })
 
 
@@ -505,6 +521,22 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
     <div id="cal-result" style="margin-top:8px;font-size:.78rem;color:#555;min-height:16px"></div>
   </div>
 
+  <!-- Base parking position -->
+  <div class="section" style="margin-top:14px;max-width:520px">
+    <h3>Base parking position</h3>
+    <p style="font-size:.76rem;color:#666;margin-bottom:10px">
+      Define where the robot should stop when returning to base. Place the base QR in view,
+      then click <b>Pick position</b> and click the desired parking spot on the image.
+    </p>
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <button class="btn-primary" onclick="openParkModal()">Pick position</button>
+      <button class="btn-neutral btn-sm" onclick="clearParking()">Clear</button>
+      <span style="font-size:.8rem;color:#666">
+        Offset: <span id="setup-parking-offset" style="color:#e8e8e8;font-family:monospace">not set</span>
+      </span>
+    </div>
+  </div>
+
   <!-- Bot forward direction -->
   <div class="section" style="margin-top:14px;max-width:520px">
     <h3>Bot forward direction</h3>
@@ -516,6 +548,23 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
       <button class="btn-warn" onclick="openDirModal()">Draw forward arrow</button>
       <span style="font-size:.8rem;color:#666">
         Current offset: <span id="setup-heading-offset" style="color:#e8e8e8;font-family:monospace">—</span>
+      </span>
+    </div>
+  </div>
+
+  <!-- Background reference -->
+  <div class="section" style="margin-top:14px;max-width:520px">
+    <h3>Background reference (obstacle detection)</h3>
+    <p style="font-size:.76rem;color:#666;margin-bottom:10px">
+      Clear the arena of all movable objects, then click <b>Set Background</b>.
+      The system will flag and avoid any foreign objects that appear in the robot's path.
+      <span style="color:#888">Red × markers on camera = detected obstacles.</span>
+    </p>
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <button class="btn-primary" onclick="setBackground()">Set Background</button>
+      <button class="btn-neutral btn-sm" onclick="clearBackground()">Clear</button>
+      <span style="font-size:.8rem;color:#666">
+        Status: <span id="setup-bg-status" style="font-family:monospace">checking…</span>
       </span>
     </div>
   </div>
@@ -564,9 +613,7 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
       <div class="section" id="dest-section" style="display:none">
         <h3>Select Destination</h3>
         <div class="dest-grid" id="dest-grid">
-          <button class="btn-success" onclick="selectDest('station_1')">Station 1</button>
-          <button class="btn-success" onclick="selectDest('station_2')">Station 2</button>
-          <button class="btn-success" onclick="selectDest('station_3')">Station 3</button>
+          <!-- injected by JS -->
         </div>
       </div>
 
@@ -636,6 +683,32 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
   </div>
 </div>
 
+<!-- ─── PARKING MODAL ──────────────────────────────────────────────────── -->
+<div id="park-modal" style="display:none;position:fixed;inset:0;
+  background:rgba(0,0,0,.88);z-index:1000;justify-content:center;align-items:center">
+  <div style="background:#1a1a2e;border-radius:12px;padding:20px;
+    max-width:95vw;max-height:95vh;display:flex;flex-direction:column;gap:12px;
+    border:2px solid #7c3aed">
+    <h2 style="color:#a78bfa;font-size:1rem;margin:0">Set Base Parking Position</h2>
+    <p style="font-size:.78rem;color:#888;margin:0">
+      Click the spot where the robot should park near the
+      <b style="color:#4ade80">base QR</b>. Green box = base QR.
+      Orange circle = current parking spot.
+    </p>
+    <div style="overflow:auto;border-radius:6px;background:#111">
+      <canvas id="park-canvas" style="max-width:80vw;cursor:crosshair;display:block"></canvas>
+    </div>
+    <div id="park-status" style="font-size:.78rem;color:#fb923c;min-height:14px"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn-neutral btn-sm" onclick="refreshParkFrame()">Refresh frame</button>
+      <button class="btn-success btn-sm" id="park-confirm" onclick="confirmParking()" disabled>
+        Save position
+      </button>
+      <button class="btn-neutral btn-sm" onclick="closeParkModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <!-- ─── DIRECTION MODAL ─────────────────────────────────────────────────── -->
 <div id="dir-modal" style="display:none;position:fixed;inset:0;
   background:rgba(0,0,0,.88);z-index:1000;justify-content:center;align-items:center">
@@ -669,9 +742,10 @@ const STATION_LABELS = {bot:'Bot',base:'Base',station_1:'Station 1',station_2:'S
 const FLOW_STATES    = ['idle','going_to_package','picking_up','returning_to_base',
                         'awaiting_destination','going_to_station','dropping_off'];
 
-let stationsData = {};
-let allQrPayloads = [];
-let missionState  = 'idle';
+let stationsData   = {};
+let allQrPayloads  = [];
+let missionState   = 'idle';
+let fullStationKeys = new Set();  // station keys (station_1 etc.) currently full
 
 // ── tabs ──────────────────────────────────────────────────────────────────────
 function showTab(id) {
@@ -743,6 +817,13 @@ function applyState(s) {
   allQrPayloads = s.all_qr_payloads || [];
   missionState  = s.mission_state || 'idle';
 
+  // Map full QR payloads → station keys
+  const fullQRs = new Set(s.full_station_qrs || []);
+  fullStationKeys = new Set();
+  for (const [key, qr] of Object.entries(stationsData)) {
+    if (qr && fullQRs.has(qr)) fullStationKeys.add(key);
+  }
+
   // Header badges
   const nb = document.getElementById('nav-badge');
   nb.textContent = 'nav: ' + s.nav_status;
@@ -760,6 +841,7 @@ function applyState(s) {
 
   applyFlow(missionState);
   renderPackages(allQrPayloads);
+  renderDestButtons();
 
   // Show/hide destination panel
   document.getElementById('dest-section').style.display =
@@ -797,8 +879,10 @@ function renderStations() {
       extra = `<button class="btn-neutral btn-sm" onclick="generateBaseQR()" title="Generate and print base QR">⚙ Generate</button>`;
     }
 
+    const isFull = fullStationKeys.has(key);
     row.innerHTML = `
       <span class="label">${STATION_LABELS[key]}</span>
+      ${isFull ? '<span class="badge" style="background:#7f1d1d;color:#fca5a5;font-size:.65rem">FULL</span>' : ''}
       <span class="qr-val ${qr ? '' : 'empty'}">${qr ? esc(qr) : 'not set'}</span>
       ${extra}
       <button class="btn-primary btn-sm" onclick="scanStation('${key}')">Scan</button>
@@ -925,11 +1009,12 @@ function renderTestButtons() {
   if (!grid) return;
   grid.innerHTML = '';
   STATION_KEYS.forEach(key => {
-    const qr = stationsData[key];
-    const btn = document.createElement('button');
-    btn.className = 'btn-primary';
-    btn.textContent = 'Go to ' + STATION_LABELS[key];
-    btn.disabled = !qr || missionState !== 'idle';
+    const qr   = stationsData[key];
+    const full = fullStationKeys.has(key);
+    const btn  = document.createElement('button');
+    btn.className   = full ? 'btn-warn' : 'btn-primary';
+    btn.textContent = 'Go to ' + STATION_LABELS[key] + (full ? ' ⚠ FULL' : '');
+    btn.disabled    = !qr || missionState !== 'idle';
     if (qr) btn.onclick = () => testGoto(key);
     grid.appendChild(btn);
   });
@@ -976,6 +1061,22 @@ async function testGoto(station) {
 async function testStop() {
   const r = await fetch('/api/test/stop', {method:'POST'});
   addLog((await r.json()).ok ? 'Testing: motors stopped' : 'Stop failed');
+}
+
+// ── destination buttons ───────────────────────────────────────────────────────
+function renderDestButtons() {
+  const grid = document.getElementById('dest-grid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  ['station_1','station_2','station_3'].forEach(key => {
+    const full = fullStationKeys.has(key);
+    const btn  = document.createElement('button');
+    btn.className = full ? 'btn-danger' : 'btn-success';
+    btn.textContent = STATION_LABELS[key] + (full ? ' (FULL)' : '');
+    btn.disabled = (missionState !== 'awaiting_destination') || full;
+    btn.onclick  = () => selectDest(key);
+    grid.appendChild(btn);
+  });
 }
 
 // ── mission actions ───────────────────────────────────────────────────────────
@@ -1032,6 +1133,142 @@ setInterval(async () => {
     applyNxt(d.connected);
   } catch(_){}
 }, 3000);
+
+// ── parking modal ─────────────────────────────────────────────────────────────
+let _parkInfo  = null;   // base QR info from server
+let _parkClick = null;   // {x, y} clicked in image coords
+let _parkImgEl = null;
+
+function _drawParkCanvas() {
+  const canvas = document.getElementById('park-canvas');
+  if (!_parkImgEl) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width  = _parkImgEl.naturalWidth;
+  canvas.height = _parkImgEl.naturalHeight;
+  ctx.drawImage(_parkImgEl, 0, 0);
+
+  if (!_parkInfo || !_parkInfo.found) {
+    ctx.fillStyle = '#ff4444';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.fillText('Base QR not detected — refresh or check camera.', 16, 36);
+    return;
+  }
+
+  const {cx, cy, x, y, w, h, offset} = _parkInfo;
+
+  // Base QR box
+  ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 3;
+  ctx.strokeRect(x, y, w, h);
+  ctx.fillStyle = '#00ff88';
+  ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI*2); ctx.fill();
+
+  // Existing parking offset
+  if (offset) {
+    const px = cx + offset.dx, py = cy + offset.dy;
+    ctx.fillStyle = '#ff8c00';
+    ctx.beginPath(); ctx.arc(px, py, 10, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(px, py, 10, 0, Math.PI*2); ctx.stroke();
+    ctx.fillStyle = '#ff8c00'; ctx.font = 'bold 12px sans-serif';
+    ctx.fillText('current', px + 14, py + 5);
+  }
+
+  // New click position
+  if (_parkClick) {
+    ctx.fillStyle = '#38bdf8';
+    ctx.beginPath(); ctx.arc(_parkClick.x, _parkClick.y, 10, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(_parkClick.x, _parkClick.y, 10, 0, Math.PI*2); ctx.stroke();
+    ctx.fillStyle = '#38bdf8'; ctx.font = 'bold 12px sans-serif';
+    ctx.fillText('new', _parkClick.x + 14, _parkClick.y + 5);
+  }
+}
+
+async function openParkModal() {
+  document.getElementById('park-modal').style.display = 'flex';
+  document.getElementById('park-status').textContent  = 'Loading…';
+  _parkClick = null;
+  document.getElementById('park-confirm').disabled = true;
+  await refreshParkFrame();
+}
+
+async function refreshParkFrame() {
+  const [infoRes, imgUrl] = await Promise.all([
+    fetch('/api/setup/base-parking-info').then(r => r.json()),
+    Promise.resolve('/api/setup/snapshot?' + Date.now()),
+  ]);
+  _parkInfo = infoRes;
+
+  const status = document.getElementById('park-status');
+  if (!infoRes.found) {
+    status.textContent = '⚠ ' + (infoRes.reason || 'Base QR not found');
+  } else {
+    const off = infoRes.offset;
+    status.textContent = off
+      ? `Current offset: (${off.dx}, ${off.dy}) px from base centre`
+      : 'No parking position set — click to place one.';
+    _applyParkingOffset(off);
+  }
+
+  const img = new Image();
+  img.onload = () => { _parkImgEl = img; _drawParkCanvas(); };
+  img.src = imgUrl;
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('park-canvas').addEventListener('click', e => {
+    if (!_parkInfo || !_parkInfo.found) return;
+    const canvas = document.getElementById('park-canvas');
+    const rect   = canvas.getBoundingClientRect();
+    const scaleX = canvas.width  / rect.width;
+    const scaleY = canvas.height / rect.height;
+    _parkClick = {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top)  * scaleY,
+    };
+    _drawParkCanvas();
+    document.getElementById('park-confirm').disabled = false;
+    document.getElementById('park-status').textContent =
+      `New position set — click Save to confirm.`;
+  });
+});
+
+async function confirmParking() {
+  if (!_parkClick || !_parkInfo || !_parkInfo.found) return;
+  const dx = _parkClick.x - _parkInfo.cx;
+  const dy = _parkClick.y - _parkInfo.cy;
+  const r = await fetch('/api/setup/base-parking', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({dx, dy}),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    addLog(`Parking position saved (offset ${dx.toFixed(0)}, ${dy.toFixed(0)} px)`);
+    _applyParkingOffset({dx, dy});
+    closeParkModal();
+  } else {
+    document.getElementById('park-status').textContent = 'Error: ' + d.reason;
+  }
+}
+
+async function clearParking() {
+  const r = await fetch('/api/setup/base-parking/clear', {method: 'POST'});
+  if ((await r.json()).ok) {
+    addLog('Parking position cleared');
+    _applyParkingOffset(null);
+  }
+}
+
+function _applyParkingOffset(off) {
+  const el = document.getElementById('setup-parking-offset');
+  if (!el) return;
+  el.textContent = off ? `(${off.dx.toFixed(0)}, ${off.dy.toFixed(0)}) px` : 'not set';
+}
+
+function closeParkModal() {
+  document.getElementById('park-modal').style.display = 'none';
+  _parkClick = null; _parkInfo = null; _parkImgEl = null;
+}
 
 // ── direction modal ───────────────────────────────────────────────────────────
 let _dirQrInfo   = null;
@@ -1181,6 +1418,37 @@ async function calibrateScale() {
   }
 }
 
+// ── background subtraction ────────────────────────────────────────────────────
+async function setBackground() {
+  const el = document.getElementById('setup-bg-status');
+  el.textContent = 'capturing…';
+  el.style.color = '#fb923c';
+  try {
+    const d = await (await fetch('/api/setup/set-background', {method:'POST'})).json();
+    if (d.ok) {
+      el.textContent = 'set';
+      el.style.color = '#4ade80';
+      addLog('Background reference captured — obstacle detection active');
+    } else {
+      el.textContent = 'failed: ' + d.reason;
+      el.style.color = '#ef4444';
+    }
+  } catch(e) {
+    el.textContent = 'error';
+    el.style.color = '#ef4444';
+  }
+}
+
+async function clearBackground() {
+  const d = await (await fetch('/api/setup/clear-background', {method:'POST'})).json();
+  const el = document.getElementById('setup-bg-status');
+  if (d.ok) {
+    el.textContent = 'not set';
+    el.style.color = '#555';
+    addLog('Background reference cleared — obstacle detection off');
+  }
+}
+
 // Bootstrap
 (async () => {
   try {
@@ -1192,6 +1460,15 @@ async function calibrateScale() {
     const info = await (await fetch('/api/setup/bot-qr-info')).json();
     if (info.current_offset != null)
       _applyHeadingOffset(parseFloat((info.current_offset * 180 / Math.PI).toFixed(1)));
+  } catch(_) {}
+  try {
+    const pinfo = await (await fetch('/api/setup/base-parking-info')).json();
+    if (pinfo.offset) _applyParkingOffset(pinfo.offset);
+  } catch(_) {}
+  try {
+    const bg = await (await fetch('/api/setup/bg-status')).json();
+    const el = document.getElementById('setup-bg-status');
+    if (el) { el.textContent = bg.set ? 'set' : 'not set'; el.style.color = bg.set ? '#4ade80' : '#555'; }
   } catch(_) {}
   connectWS();
 })();
@@ -1256,6 +1533,7 @@ async def api_status():
         "package_qr":      _mission.package_qr if _mission else None,
         "destination":     _mission.destination if _mission else None,
         "stations":        _registry.all() if _registry else {},
+        "full_station_qrs": list(s.full_station_qrs) if s else [],
     }
 
 
@@ -1303,6 +1581,10 @@ async def api_setup_assign(body: dict):
         log.info("Setup: %s → %s", station, qr)
         if station == "bot":
             _apply_bot_qr()
+        if station == "base":
+            _apply_base_parking()
+        if station in ("station_1", "station_2", "station_3"):
+            _apply_station_qrs()
         asyncio.create_task(_broadcast_state())
         return {"ok": True}
     except ValueError as e:
@@ -1315,9 +1597,10 @@ async def api_setup_clear(body: dict):
     if station not in STATION_KEYS:
         return {"ok": False, "reason": "unknown station"}
     _registry.clear(station)
+    if station in ("station_1", "station_2", "station_3"):
+        _apply_station_qrs()
     asyncio.create_task(_broadcast_state())
     return {"ok": True}
-
 
 # ── mission routes ────────────────────────────────────────────────────────────
 
@@ -1527,6 +1810,94 @@ async def api_generate_base():
         return {"ok": False, "reason": str(e)}
 
 
+# ── base parking routes ───────────────────────────────────────────────────────
+
+@app.get("/api/setup/base-parking-info")
+async def api_base_parking_info():
+    """Base QR position in current frame + stored parking offset."""
+    base_qr = _registry.get("base") if _registry else None
+    if not base_qr:
+        return {"found": False, "reason": "base QR not registered"}
+    if _navigator is None:
+        return {"found": False, "reason": "navigator not running"}
+    with _navigator._frame_lock:
+        frame = _navigator._raw_frame.copy() if _navigator._raw_frame is not None else None
+    if frame is None:
+        return {"found": False, "reason": "no camera frame yet"}
+    items = _detect_overhead(frame)
+    base  = next((i for i in items if i["payload"] == base_qr), None)
+    offset = _registry.get_base_parking_offset() if _registry else None
+    if not base:
+        return {
+            "found": False,
+            "reason": "base QR not visible in frame",
+            "offset": {"dx": offset[0], "dy": offset[1]} if offset else None,
+        }
+    c = base["corners"]
+    return {
+        "found":  True,
+        "cx":     base["cx"],
+        "cy":     base["cy"],
+        "x":      int(c[:, 0].min()),
+        "y":      int(c[:, 1].min()),
+        "w":      int(c[:, 0].max() - c[:, 0].min()),
+        "h":      int(c[:, 1].max() - c[:, 1].min()),
+        "offset": {"dx": offset[0], "dy": offset[1]} if offset else None,
+    }
+
+
+@app.post("/api/setup/base-parking")
+async def api_base_parking_set(body: dict):
+    """Save parking offset (dx, dy) relative to base QR centre."""
+    dx = body.get("dx")
+    dy = body.get("dy")
+    if dx is None or dy is None:
+        return {"ok": False, "reason": "dx and dy required"}
+    _registry.set_base_parking_offset(float(dx), float(dy))
+    _apply_base_parking()
+    return {"ok": True}
+
+
+@app.post("/api/setup/base-parking/clear")
+async def api_base_parking_clear():
+    """Remove stored parking offset (robot will stop at base QR centre)."""
+    _registry.clear_base_parking_offset()
+    _apply_base_parking()
+    return {"ok": True}
+
+
+# ── background subtraction routes ────────────────────────────────────────────
+
+@app.post("/api/setup/set-background")
+async def api_set_background():
+    """Capture current frame as the clean background reference."""
+    if _navigator is None:
+        return {"ok": False, "reason": "navigator not running"}
+    with _navigator._frame_lock:
+        frame = _navigator._raw_frame.copy() if _navigator._raw_frame is not None else None
+    if frame is None:
+        return {"ok": False, "reason": "no camera frame yet"}
+    cv2.imwrite(BG_FRAME_PATH, frame)
+    _navigator.set_background(frame)
+    log.info("Background reference captured and saved to %s", BG_FRAME_PATH)
+    return {"ok": True}
+
+
+@app.post("/api/setup/clear-background")
+async def api_clear_background():
+    """Delete stored background reference (disables obstacle detection)."""
+    if os.path.exists(BG_FRAME_PATH):
+        os.remove(BG_FRAME_PATH)
+    if _navigator:
+        _navigator.set_background(None)
+    return {"ok": True}
+
+
+@app.get("/api/setup/bg-status")
+async def api_bg_status():
+    return {"set": os.path.exists(BG_FRAME_PATH)}
+
+
 # ── test routes ──────────────────────────────────────────────────────────────
 
 @app.post("/api/test/goto")
@@ -1618,6 +1989,9 @@ async def api_camera_switch(body: dict):
     _app_config.camera_index = idx
     _navigator = build_navigator(_app_config, on_state_change=_on_state_change)
     _apply_bot_qr()
+    _apply_base_parking()
+    _apply_station_qrs()
+    _load_background()
     if _mission:
         _mission._nav = _navigator
     _nav_thread = threading.Thread(target=_navigator.run, daemon=True, name="navigator")
@@ -1664,6 +2038,38 @@ def _apply_bot_qr() -> None:
                  bot_qr or "None", math.degrees(offset), _navigator._claw_offset_px)
 
 
+def _apply_base_parking() -> None:
+    """Push base QR and parking offset from registry into the navigator."""
+    if _navigator and _registry:
+        base_qr = _registry.get("base")
+        offset  = _registry.get_base_parking_offset()
+        _navigator.set_base_qr(base_qr)
+        _navigator.set_parking_offset(offset)
+        log.info("Navigator base_qr=%s parking_offset=%s", base_qr or "None", offset)
+
+
+def _apply_station_qrs() -> None:
+    """Push registered delivery station QRs into the navigator for occlusion tracking."""
+    if _navigator and _registry:
+        qrs = {_registry.get(k) for k in ("station_1", "station_2", "station_3")
+               if _registry.get(k)}
+        _navigator.set_station_qrs(qrs)
+        log.info("Navigator station_qrs=%s", qrs)
+
+
+def _load_background() -> None:
+    """Reload saved background reference frame into the navigator (persists across restarts)."""
+    if _navigator is None:
+        return
+    if os.path.exists(BG_FRAME_PATH):
+        frame = cv2.imread(BG_FRAME_PATH)
+        if frame is not None:
+            _navigator.set_background(frame)
+            log.info("Background reference loaded from %s", BG_FRAME_PATH)
+            return
+    _navigator.set_background(None)
+
+
 @app.on_event("startup")
 async def _startup():
     global _loop, _navigator, _nav_thread, _mission, _registry
@@ -1672,6 +2078,9 @@ async def _startup():
 
     _navigator = build_navigator(_app_config, on_state_change=_on_state_change)
     _apply_bot_qr()
+    _apply_base_parking()
+    _apply_station_qrs()
+    _load_background()
 
     _mission   = MissionController(_navigator, _registry)
     _mission.set_on_change(

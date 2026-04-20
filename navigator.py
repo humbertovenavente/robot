@@ -28,6 +28,14 @@ log = logging.getLogger(__name__)
 DEFAULT_CENTER_TOL_PX    = 40
 DEFAULT_ARRIVED_AREA_PCT = 0.15   # onboard mode
 DEFAULT_ARRIVED_DIST_PX  = 80     # overhead mode: pixels bot→target = arrived
+
+_REPULSE_RADIUS_PX   = 150   # px from obstacle centre where repulsion starts
+_OCCLUDE_FULL_FRAMES  = 45   # consecutive missing frames → station "full"  (~1.8 s at 25 fps)
+_OCCLUDE_CLEAR_FRAMES = 8    # consecutive visible frames → station cleared
+_BG_BLUR_K           = 21   # Gaussian blur kernel for background subtraction
+_BG_THRESHOLD        = 40   # pixel intensity diff to count as changed
+_BG_MIN_AREA         = 600  # minimum contour area (px²) to count as obstacle
+_BG_QR_MASK_PAD      = 40   # px padding around QR boxes excluded from diff
 DEFAULT_CLAW_OFFSET_PX   = 0      # 0 = disabled; set to px≡11cm for claw delivery
 DEFAULT_DRIVE_SPEED      = 50
 DEFAULT_TURN_SPEED       = 35
@@ -52,6 +60,9 @@ class NavigatorState:
     target_pos: Optional[Tuple[float, float]] = None
     dist_to_target: Optional[float] = None
     heading_error: Optional[float] = None
+    parking_target_pos: Optional[Tuple[float, float]] = None  # base park spot
+    full_station_qrs: List[str] = field(default_factory=list) # occluded stations
+    bg_obstacle_pos: List[Tuple[float, float]] = field(default_factory=list)  # non-QR obstacles
 
 
 StateCallback = Callable[[NavigatorState], None]
@@ -165,6 +176,47 @@ class StubDrive(DriveInterface):
         log.info("StubDrive: close_claw")
 
 
+# ── obstacle-avoidance heading ────────────────────────────────────────────────
+
+def _avoidance_heading(bx: float, by: float, tx: float, ty: float,
+                        items: List[Dict], exclude: set,
+                        extra_repellers: list = (),
+                        repulse_radius: float = _REPULSE_RADIUS_PX) -> float:
+    """Potential-field heading: attract toward (tx,ty), repel from obstacle QRs + bg blobs.
+
+    Items whose payload is in `exclude` (bot + current target) are ignored.
+    extra_repellers: list of (ox, oy) pixel coordinates for non-QR obstacles.
+    Returns angle in image coords (0 = right, π/2 = down).
+    """
+    adx, ady = tx - bx, ty - by
+    d_target = math.hypot(adx, ady)
+    if d_target > 0:
+        adx /= d_target
+        ady /= d_target
+
+    rx, ry = 0.0, 0.0
+    for item in items:
+        if item["payload"] in exclude:
+            continue
+        ox, oy = item["cx"], item["cy"]
+        d = math.hypot(ox - bx, oy - by)
+        if d < 1 or d >= repulse_radius:
+            continue
+        strength = ((repulse_radius - d) / repulse_radius) ** 2
+        rx += strength * (bx - ox) / d
+        ry += strength * (by - oy) / d
+
+    for ox, oy in extra_repellers:
+        d = math.hypot(ox - bx, oy - by)
+        if d < 1 or d >= repulse_radius:
+            continue
+        strength = ((repulse_radius - d) / repulse_radius) ** 2
+        rx += strength * (bx - ox) / d
+        ry += strength * (by - oy) / d
+
+    return math.atan2(ady + ry, adx + rx)
+
+
 # ── navigator ─────────────────────────────────────────────────────────────────
 
 class QRNavigator:
@@ -204,6 +256,13 @@ class QRNavigator:
         self._bot_qr           = bot_qr
         self._navigating       = False
         self._on_state         = on_state_change
+        self._base_qr:         Optional[str]                    = None
+        self._parking_offset:  Optional[Tuple[float, float]]    = None
+        self._station_qrs:     set                              = set()
+        self._qr_missing_frames: Dict[str, int]                 = {}
+        self._qr_clear_frames:  Dict[str, int]                  = {}
+        self._full_stations:   set                              = set()
+        self._bg_gray:         Optional[np.ndarray]             = None
 
         self.state             = NavigatorState()
         self._running          = False
@@ -217,6 +276,61 @@ class QRNavigator:
 
     def set_bot_qr(self, qr: Optional[str]) -> None:
         self._bot_qr = qr
+
+    def set_base_qr(self, qr: Optional[str]) -> None:
+        self._base_qr = qr
+
+    def set_parking_offset(self, offset: Optional[Tuple[float, float]]) -> None:
+        self._parking_offset = offset
+
+    def set_background(self, frame: Optional[np.ndarray]) -> None:
+        """Store a blurred grayscale reference frame for background subtraction."""
+        if frame is None:
+            self._bg_gray = None
+        else:
+            blur = cv2.GaussianBlur(frame, (_BG_BLUR_K, _BG_BLUR_K), 0)
+            self._bg_gray = cv2.cvtColor(blur, cv2.COLOR_BGR2GRAY)
+
+    def _detect_bg_obstacles(self, frame: np.ndarray,
+                              qr_rects: list) -> List[Tuple[float, float]]:
+        """Diff against stored background; return centroids of changed blobs not covered by QRs."""
+        if self._bg_gray is None:
+            return []
+        fh, fw = frame.shape[:2]
+        if self._bg_gray.shape != (fh, fw):
+            return []
+        blur  = cv2.GaussianBlur(frame, (_BG_BLUR_K, _BG_BLUR_K), 0)
+        gray  = cv2.cvtColor(blur, cv2.COLOR_BGR2GRAY)
+        diff  = cv2.absdiff(self._bg_gray, gray)
+        _, thresh = cv2.threshold(diff, _BG_THRESHOLD, 255, cv2.THRESH_BINARY)
+        for (_, rx, ry, rw, rh) in qr_rects:
+            pad = _BG_QR_MASK_PAD
+            x1, y1 = max(0, rx - pad), max(0, ry - pad)
+            x2, y2 = min(fw, rx + rw + pad), min(fh, ry + rh + pad)
+            thresh[y1:y2, x1:x2] = 0
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        out = []
+        for cnt in contours:
+            if cv2.contourArea(cnt) < _BG_MIN_AREA:
+                continue
+            M = cv2.moments(cnt)
+            if M["m00"] == 0:
+                continue
+            out.append((M["m10"] / M["m00"], M["m01"] / M["m00"]))
+        return out
+
+    def set_station_qrs(self, qrs: set) -> None:
+        self._station_qrs = set(qrs)
+        # Drop tracking data for QRs no longer registered
+        for qr in list(self._qr_missing_frames):
+            if qr not in self._station_qrs:
+                del self._qr_missing_frames[qr]
+                self._qr_clear_frames.pop(qr, None)
+        self._full_stations &= self._station_qrs
+
+    @property
+    def full_stations(self) -> set:
+        return frozenset(self._full_stations)
 
     def set_navigating(self, active: bool) -> None:
         self._navigating = active
@@ -274,6 +388,21 @@ class QRNavigator:
                 if st.dist_to_target is not None:
                     cv2.putText(frame, f"{st.dist_to_target:.0f}px",
                                 mid, cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 220, 220), 1)
+
+        # Background-subtraction obstacle markers (red)
+        for ox, oy in st.bg_obstacle_pos:
+            ix, iy = int(ox), int(oy)
+            cv2.circle(frame, (ix, iy), 12, (0, 0, 220), 2)
+            cv2.line(frame, (ix - 9, iy - 9), (ix + 9, iy + 9), (0, 0, 220), 2)
+            cv2.line(frame, (ix + 9, iy - 9), (ix - 9, iy + 9), (0, 0, 220), 2)
+
+        # Parking position marker (orange filled circle with label)
+        if st.parking_target_pos:
+            px, py = int(st.parking_target_pos[0]), int(st.parking_target_pos[1])
+            cv2.circle(frame, (px, py), 10, (0, 140, 255), -1)
+            cv2.circle(frame, (px, py), 10, (255, 255, 255), 2)
+            cv2.putText(frame, "PARK", (px + 13, py + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 140, 255), 1)
 
         # Onboard: center guide + QR marker
         if not self._bot_qr and st.qr_cx is not None:
@@ -385,6 +514,35 @@ class QRNavigator:
         target = next((i for i in items if i["payload"] == self._target_qr), None) \
                  if self._target_qr else None
 
+        # ── Occlusion tracking (station QRs only) ────────────────────────────
+        visible_set = set(all_payloads)
+        camera_ok   = bool(visible_set)   # anything in frame → camera is working
+        for qr in self._station_qrs:
+            if qr in visible_set:
+                self._qr_missing_frames[qr] = 0
+                self._qr_clear_frames[qr]   = self._qr_clear_frames.get(qr, 0) + 1
+                if self._qr_clear_frames[qr] >= _OCCLUDE_CLEAR_FRAMES:
+                    self._full_stations.discard(qr)
+            elif camera_ok:
+                self._qr_clear_frames[qr]   = 0
+                self._qr_missing_frames[qr] = self._qr_missing_frames.get(qr, 0) + 1
+                if self._qr_missing_frames[qr] >= _OCCLUDE_FULL_FRAMES:
+                    self._full_stations.add(qr)
+        full_list = list(self._full_stations)
+
+        # ── Background-subtraction obstacle detection ─────────────────────────
+        bg_obstacles = self._detect_bg_obstacles(frame, all_rects)
+
+        # ── Parking marker ────────────────────────────────────────────────────
+        park_pos: Optional[Tuple[float, float]] = None
+        if self._base_qr and self._parking_offset:
+            base_item = next((i for i in items if i["payload"] == self._base_qr), None)
+            if base_item:
+                park_pos = (
+                    base_item["cx"] + self._parking_offset[0],
+                    base_item["cy"] + self._parking_offset[1],
+                )
+
         if bot is None:
             self._drive.stop_motors()
             self._set_state(
@@ -394,6 +552,8 @@ class QRNavigator:
                 all_qr_payloads=all_payloads, all_qr_rects=all_rects,
                 bot_pos=None, bot_heading=None,
                 target_pos=None, dist_to_target=None, heading_error=None,
+                parking_target_pos=park_pos, full_station_qrs=full_list,
+                bg_obstacle_pos=bg_obstacles,
             )
             return
 
@@ -409,11 +569,12 @@ class QRNavigator:
                 all_qr_payloads=all_payloads, all_qr_rects=all_rects,
                 bot_pos=(bx, by), bot_heading=bot_hdg,
                 target_pos=None, dist_to_target=None, heading_error=None,
+                parking_target_pos=park_pos, full_station_qrs=full_list,
+                bg_obstacle_pos=bg_obstacles,
             )
             return
 
         if target is None:
-            # Can see bot but not target — stop and wait
             self._drive.stop_motors()
             self._set_state(
                 status="searching",
@@ -422,14 +583,20 @@ class QRNavigator:
                 all_qr_payloads=all_payloads, all_qr_rects=all_rects,
                 bot_pos=(bx, by), bot_heading=bot_hdg,
                 target_pos=None, dist_to_target=None, heading_error=None,
+                parking_target_pos=park_pos, full_station_qrs=full_list,
+                bg_obstacle_pos=bg_obstacles,
             )
             return
 
-        tx, ty   = target["cx"], target["cy"]
-        dx, dy   = tx - bx, ty - by
+        tx, ty = target["cx"], target["cy"]
+        if self._parking_offset and self._target_qr == self._base_qr:
+            eff_tx = tx + self._parking_offset[0]
+            eff_ty = ty + self._parking_offset[1]
+        else:
+            eff_tx, eff_ty = tx, ty
+        dx, dy   = eff_tx - bx, eff_ty - by
         distance = math.hypot(dx, dy)
 
-        # Claw mode: stop when bot QR is claw_offset_px from target (claw tip on target)
         arrived_threshold = (
             self._claw_offset_px
             if (self._use_claw_arrived and self._claw_offset_px > 0)
@@ -443,14 +610,18 @@ class QRNavigator:
                 frame_w=fw, frame_h=fh,
                 all_qr_payloads=all_payloads, all_qr_rects=all_rects,
                 bot_pos=(bx, by), bot_heading=bot_hdg,
-                target_pos=(tx, ty), dist_to_target=distance, heading_error=0.0,
+                target_pos=(eff_tx, eff_ty), dist_to_target=distance, heading_error=0.0,
+                parking_target_pos=park_pos, full_station_qrs=full_list,
+                bg_obstacle_pos=bg_obstacles,
             )
             log.info("Navigator (overhead): arrived at '%s' dist=%.1fpx",
                      self._target_qr, distance)
             return
 
-        # Desired heading: vector from bot to target (image y-down coords)
-        desired = math.atan2(dy, dx)
+        # Potential-field heading: avoids QR codes + background-subtraction blobs
+        desired = _avoidance_heading(bx, by, eff_tx, eff_ty, items,
+                                     exclude={self._bot_qr, self._target_qr},
+                                     extra_repellers=bg_obstacles)
         err     = _angle_diff(desired, bot_hdg)
 
         if abs(err) > self._align_threshold:
@@ -473,7 +644,9 @@ class QRNavigator:
             frame_w=fw, frame_h=fh,
             all_qr_payloads=all_payloads, all_qr_rects=all_rects,
             bot_pos=(bx, by), bot_heading=bot_hdg,
-            target_pos=(tx, ty), dist_to_target=distance, heading_error=err,
+            target_pos=(eff_tx, eff_ty), dist_to_target=distance, heading_error=err,
+            parking_target_pos=park_pos, full_station_qrs=full_list,
+            bg_obstacle_pos=bg_obstacles,
         )
 
     # ── internal ──────────────────────────────────────────────────────────────
