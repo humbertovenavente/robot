@@ -308,12 +308,14 @@ class MissionController:
             return
         drive = self._nav._drive
         self._nav.set_navigating(False)
+        self._nav.set_motor_override(True)
         try:
             # Needs to be gentle, but still above drivetrain static friction.
             nudge_speed = max(65, min(75, int(getattr(self._nav, "_drive_speed", 50))))
             drive.move_forward(nudge_speed)
             time.sleep(duration_s)
         finally:
+            self._nav.set_motor_override(False)
             drive.stop_motors()
 
     def _clear_base_forward(self, distance_px: Optional[float] = None, timeout_s: float = 4.0) -> None:
@@ -344,6 +346,7 @@ class MissionController:
         ux, uy = math.cos(hdg), math.sin(hdg)
         drive = self._nav._drive
         self._nav.set_navigating(False)
+        self._nav.set_motor_override(True)
         try:
             clear_speed = max(65, min(75, int(getattr(self._nav, "_drive_speed", 50))))
             drive.move_forward(clear_speed)
@@ -362,17 +365,20 @@ class MissionController:
                     break
                 time.sleep(0.03)
         finally:
+            self._nav.set_motor_override(False)
             drive.stop_motors()
 
     def _station_push_forward(self, duration_s: float = 0.4) -> None:
         """After station QR occlusion, keep moving forward a bit so the package lands more centered."""
         drive = self._nav._drive
         self._nav.set_navigating(False)
+        self._nav.set_motor_override(True)
         try:
             push_speed = max(30, min(60, int(getattr(self._nav, "_drive_speed", 50) * 0.8)))
             drive.move_forward(push_speed)
             time.sleep(duration_s)
         finally:
+            self._nav.set_motor_override(False)
             drive.stop_motors()
 
     def _run(self) -> None:
@@ -1198,9 +1204,16 @@ function renderPackages(qrs) {
   pkgs.forEach(qr => {
     const row = document.createElement('div');
     row.className = 'pkg-item';
-    row.innerHTML = `<span class="pkg-qr">${esc(qr)}</span>
-      <button class="btn-primary btn-sm" onclick="startMission('${esc(qr)}')"
-        ${missionState !== 'idle' ? 'disabled' : ''}>Pick up</button>`;
+    const label = document.createElement('span');
+    label.className = 'pkg-qr';
+    label.textContent = qr;
+    const btn = document.createElement('button');
+    btn.className = 'btn-primary btn-sm';
+    btn.textContent = 'Pick up';
+    btn.disabled = (missionState !== 'idle');
+    btn.onclick = () => startMission(qr);
+    row.appendChild(label);
+    row.appendChild(btn);
     box.appendChild(row);
   });
 }
@@ -2507,6 +2520,9 @@ async def api_mission_start(body: dict):
         return {"ok": False, "reason": "package_qr required"}
     if not _registry.get("base"):
         return {"ok": False, "reason": "base QR not registered"}
+    if _registry and not _registry.is_package_qr(package_qr):
+        return {"ok": False, "reason": f'"{package_qr}" is registered as a station/base, not a package'}
+    log.info("Mission start requested for package_qr=%s", package_qr)
     ok = _mission.start(package_qr)
     if ok:
         asyncio.create_task(_broadcast_state())

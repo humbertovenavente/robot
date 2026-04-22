@@ -499,6 +499,7 @@ class QRNavigator:
         self._stopped_event.set()   # not running yet
         self._raw_frame: Optional[np.ndarray] = None
         self._frame_lock       = threading.Lock()
+        self._motor_override   = False  # True = frame loop must not call stop_motors()
 
     # ── public control ────────────────────────────────────────────────────────
 
@@ -591,6 +592,11 @@ class QRNavigator:
             self._drive.stop_motors()
         except Exception as exc:
             log.warning("manual stop error: %s", exc)
+
+    def set_motor_override(self, active: bool) -> None:
+        """When True the frame loop will not call stop_motors() while idle/not-navigating.
+        Use this to let mission-controller code drive directly without the loop fighting it."""
+        self._motor_override = active
 
     # ── frame annotation ──────────────────────────────────────────────────────
 
@@ -852,7 +858,8 @@ class QRNavigator:
         bot_hdg = self._smoothed_heading
 
         if not self._navigating:
-            self._drive.stop_motors()
+            if not self._motor_override:
+                self._drive.stop_motors()
             self._set_state(
                 status="idle",
                 qr_payload=None, qr_cx=int(bx), qr_area_pct=None,
@@ -986,8 +993,20 @@ class QRNavigator:
         if front_only_target and bot_aruco is not None:
             # For station/package runs, align the front axis defined by QR -> ArUco.
             align_x, align_y = bot_aruco["cx"], bot_aruco["cy"]
-        desired = _avoidance_heading(align_x, align_y, eff_tx, eff_ty, qr_items,
-                                     exclude={self._bot_qr, self._target_qr})
+        is_station_target = (
+            self._target_qr is not None
+            and self._target_qr in self._station_qrs
+            and self._target_qr != self._base_qr
+        )
+        if front_only_target and is_station_target:
+            # Stations are clustered together, so treating neighboring station QRs as
+            # repellers can bend the approach around the strip and make the robot
+            # appear to "prefer" its back side. For delivery, point the claw axis
+            # straight at the selected station instead.
+            desired = _heading_from_points(align_x, align_y, eff_tx, eff_ty, 0.0)
+        else:
+            desired = _avoidance_heading(align_x, align_y, eff_tx, eff_ty, qr_items,
+                                         exclude={self._bot_qr, self._target_qr})
         err     = _angle_diff(desired, bot_hdg)
         reverse_err = _angle_diff(desired, bot_hdg + math.pi)
         rel_dx, rel_dy = eff_tx - align_x, eff_ty - align_y
@@ -1098,8 +1117,8 @@ class QRNavigator:
             frac = min(1.0, abs(err) / math.pi)
             spd  = max(40, int(frac * self._turn_speed))
             d    = self._committed_turn_dir or (1.0 if forward_turn_err > 0 else -1.0)
-            # Tank-turn mapping for this drivetrain: positive turn dir must rotate toward target.
-            self._drive.drive(int(-spd * d), int(spd * d))
+            # d>0 = need CW/right turn → drive(+spd, -spd); d<0 = CCW/left → drive(-spd, +spd)
+            self._drive.drive(int(spd * d), int(-spd * d))
             new_status = "centering"
         else:
             # Small error → proportional differential drive (always moving forward)
