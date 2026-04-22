@@ -1,7 +1,8 @@
 """Mission-control web interface for QR-guided robot delivery.
 
 Setup:   register QR codes for base + 3 drop stations (persisted to stations.json)
-Mission: detect package QR → navigate to it → grab → return to base → deliver
+Mission: open claw → navigate to package → return to base → select station
+         → deliver → return to base → close claw
 
 Endpoints
 ---------
@@ -41,14 +42,20 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from config import load_config
-from navigator import QRNavigator, NavigatorState, build_navigator, _detect_overhead, _qr_heading
+from navigator import (
+    QRNavigator,
+    NavigatorState,
+    build_navigator,
+    _detect_aruco,
+    _detect_overhead,
+    _qr_heading,
+)
 
 QR_CODES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qr_codes")
 
 log = logging.getLogger(__name__)
 
 STATIONS_FILE  = os.path.join(os.path.dirname(__file__), "stations.json")
-BG_FRAME_PATH  = os.path.join(os.path.dirname(__file__), "bg_frame.jpg")
 STATION_KEYS  = ["bot", "base", "station_1", "station_2", "station_3"]
 STATION_LABELS = {
     "bot":       "Bot (top marker)",
@@ -101,7 +108,7 @@ class StationsRegistry:
         return all(self._data.get(k) for k in required)
 
     def qr_set(self) -> set:
-        return {v for v in self._data.values() if v}
+        return {v for v in self._data.values() if isinstance(v, str) and v}
 
     def is_package_qr(self, qr: str) -> bool:
         return bool(qr) and qr not in self.qr_set()
@@ -120,6 +127,18 @@ class StationsRegistry:
     def get_claw_offset_px(self) -> int:
         return int(self._data.get("claw_offset_px", 0))
 
+    def set_claw_center_offset_px(self, px: float) -> None:
+        self._data["claw_center_offset_px"] = round(float(px), 1)
+        self.save()
+
+    def get_claw_center_offset_px(self) -> Optional[float]:
+        px = self._data.get("claw_center_offset_px")
+        return float(px) if px is not None else None
+
+    def clear_claw_center_offset_px(self) -> None:
+        self._data.pop("claw_center_offset_px", None)
+        self.save()
+
     def set_base_parking_offset(self, dx: float, dy: float) -> None:
         self._data["base_parking_offset"] = {"dx": round(dx, 1), "dy": round(dy, 1)}
         self.save()
@@ -134,6 +153,47 @@ class StationsRegistry:
         self._data.pop("base_parking_offset", None)
         self.save()
 
+    def set_station_drop_offset(self, station_key: str, dx: float, dy: float) -> None:
+        if station_key not in ("station_1", "station_2", "station_3"):
+            raise ValueError(f"Unknown station: {station_key}")
+        offsets = self._data.setdefault("station_drop_offsets", {})
+        offsets[station_key] = {"dx": round(dx, 1), "dy": round(dy, 1)}
+        self.save()
+
+    def get_station_drop_offset(self, station_key: str) -> Optional[tuple]:
+        offsets = self._data.get("station_drop_offsets", {})
+        off = offsets.get(station_key)
+        if off and ("dx" in off) and ("dy" in off):
+            return float(off["dx"]), float(off["dy"])
+        return None
+
+    def clear_station_drop_offset(self, station_key: str) -> None:
+        offsets = self._data.get("station_drop_offsets", {})
+        offsets.pop(station_key, None)
+        if not offsets:
+            self._data.pop("station_drop_offsets", None)
+        self.save()
+
+    def all_station_drop_offsets(self) -> dict:
+        offsets = self._data.get("station_drop_offsets", {})
+        return {
+            k: {"dx": float(v["dx"]), "dy": float(v["dy"])}
+            for k, v in offsets.items()
+            if k in ("station_1", "station_2", "station_3") and ("dx" in v) and ("dy" in v)
+        }
+
+    def set_bot_aruco_id(self, marker_id: int) -> None:
+        self._data["bot_aruco_id"] = int(marker_id)
+        self.save()
+
+    def get_bot_aruco_id(self) -> Optional[int]:
+        marker_id = self._data.get("bot_aruco_id")
+        return int(marker_id) if marker_id is not None else None
+
+    def clear_bot_aruco_id(self) -> None:
+        self._data.pop("bot_aruco_id", None)
+        self.save()
+
 
 # ── mission controller ────────────────────────────────────────────────────────
 
@@ -142,8 +202,9 @@ class MissionController:
 
     States
     ------
-    idle → going_to_package → picking_up → returning_to_base →
-    awaiting_destination → going_to_station → dropping_off → idle
+    idle → opening_claw → going_to_package → grabbing_package → returning_to_base →
+    awaiting_destination → going_to_station → dropping_off →
+    returning_to_base_after_drop → closing_claw → idle
     """
 
     def __init__(self, navigator: QRNavigator, registry: StationsRegistry):
@@ -154,8 +215,11 @@ class MissionController:
         self.destination: Optional[str] = None   # station key
         self._arrived  = threading.Event()
         self._dest_set = threading.Event()
+        self._abort    = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._abort_thread: Optional[threading.Thread] = None
         self._on_change = None
+        self._claw_is_open: Optional[bool] = None
 
     def set_on_change(self, cb) -> None:
         self._on_change = cb
@@ -172,86 +236,243 @@ class MissionController:
         log.info("Mission: → %s", state)
         self._emit()
 
+    def _reset_context(self) -> None:
+        self.package_qr = None
+        self.destination = None
+
     def on_navigator_arrived(self, qr_payload: str) -> None:
         """Called by the navigator state-change hook when status == 'arrived'."""
         self._arrived.set()
 
+    def _aborted(self) -> bool:
+        return self._abort.is_set()
+
     def _navigate_to(self, qr_code: str, label: str, timeout: float = 120.0,
-                     claw_mode: bool = False) -> bool:
+                     claw_mode: bool = False, claw_adjust_px: int = 0,
+                     allow_reverse: bool = True, force_reverse: bool = False,
+                     target_offset: Optional[tuple] = None) -> bool:
         self._arrived.clear()
         self._nav.set_target(qr_code)
+        self._nav.set_target_offset(target_offset)
+        self._nav.set_motion_policy(allow_reverse=allow_reverse, force_reverse=force_reverse)
         if claw_mode:
-            self._nav.set_claw_arrived(True)
+            self._nav.set_claw_arrived(True, adjust_px=claw_adjust_px)
         self._nav.set_navigating(True)
-        log.info("Mission: navigating to %s (QR=%s, claw_mode=%s)", label, qr_code, claw_mode)
-        ok = self._arrived.wait(timeout=timeout)
+        log.info("Mission: navigating to %s (QR=%s, claw_mode=%s, claw_adjust_px=%d, allow_reverse=%s, force_reverse=%s, target_offset=%s)",
+                 label, qr_code, claw_mode, claw_adjust_px, allow_reverse, force_reverse, target_offset)
+        deadline = time.monotonic() + timeout
+        ok = False
+        while time.monotonic() < deadline:
+            if self._aborted():
+                break
+            if self._arrived.wait(timeout=0.1):
+                ok = True
+                break
         self._nav.set_navigating(False)
+        self._nav.set_target_offset(None)
+        self._nav.set_motion_policy(allow_reverse=True, force_reverse=False)
         if claw_mode:
             self._nav.set_claw_arrived(False)
+        if self._aborted():
+            log.info("Mission: aborted while navigating to %s", label)
+            return False
         if not ok:
             log.warning("Mission: timeout waiting to arrive at %s", label)
         return ok
 
-    def _claw_grab(self) -> None:
+    def _claw_open(self, settle_s: float = 0.4) -> None:
         drive = self._nav._drive
         drive.open_claw()
-        time.sleep(0.4)
-        drive.close_claw()
+        time.sleep(settle_s)
+        self._claw_is_open = True
 
-    def _claw_drop(self) -> None:
+    def _claw_close(self, settle_s: float = 0.4) -> None:
         drive = self._nav._drive
-        drive.open_claw()
-        time.sleep(1.5)
         drive.close_claw()
+        time.sleep(settle_s)
+        self._claw_is_open = False
+
+    def _near_base_parking(self) -> bool:
+        st = getattr(self._nav, "state", None)
+        if not st or not st.bot_pos or not st.parking_target_pos:
+            return False
+        dx = st.bot_pos[0] - st.parking_target_pos[0]
+        dy = st.bot_pos[1] - st.parking_target_pos[1]
+        return math.hypot(dx, dy) <= 90
+
+    def _depart_base_forward(self, duration_s: float = 2.0) -> None:
+        if not self._near_base_parking():
+            return
+        drive = self._nav._drive
+        self._nav.set_navigating(False)
+        try:
+            # Needs to be gentle, but still above drivetrain static friction.
+            nudge_speed = max(65, min(75, int(getattr(self._nav, "_drive_speed", 50))))
+            drive.move_forward(nudge_speed)
+            time.sleep(duration_s)
+        finally:
+            drive.stop_motors()
+
+    def _clear_base_forward(self, distance_px: Optional[float] = None, timeout_s: float = 4.0) -> None:
+        """Drive straight forward out of the base slot before station alignment.
+
+        Uses overhead pose to stop after advancing a target distance along the
+        current heading. Falls back to the time-based nudge if pose is missing.
+        """
+        if not self._near_base_parking():
+            return
+
+        st = getattr(self._nav, "state", None)
+        if not st or not st.bot_pos or st.bot_heading is None:
+            self._depart_base_forward()
+            return
+
+        target_px = float(distance_px) if distance_px is not None else 0.0
+        if target_px <= 0:
+            target_px = float(getattr(self._nav, "_claw_center_offset_px", 0.0) or 0.0)
+        if target_px <= 0:
+            target_px = float(getattr(self._nav, "_claw_offset_px", 0) or 0)
+        if target_px <= 0:
+            self._depart_base_forward()
+            return
+
+        start_x, start_y = st.bot_pos
+        hdg = float(st.bot_heading)
+        ux, uy = math.cos(hdg), math.sin(hdg)
+        drive = self._nav._drive
+        self._nav.set_navigating(False)
+        try:
+            clear_speed = max(65, min(75, int(getattr(self._nav, "_drive_speed", 50))))
+            drive.move_forward(clear_speed)
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                if self._aborted():
+                    break
+                cur = getattr(self._nav, "state", None)
+                if not cur or not cur.bot_pos:
+                    time.sleep(0.03)
+                    continue
+                dx = cur.bot_pos[0] - start_x
+                dy = cur.bot_pos[1] - start_y
+                forward_progress = dx * ux + dy * uy
+                if forward_progress >= target_px:
+                    break
+                time.sleep(0.03)
+        finally:
+            drive.stop_motors()
+
+    def _station_push_forward(self, duration_s: float = 0.4) -> None:
+        """After station QR occlusion, keep moving forward a bit so the package lands more centered."""
+        drive = self._nav._drive
+        self._nav.set_navigating(False)
+        try:
+            push_speed = max(30, min(60, int(getattr(self._nav, "_drive_speed", 50) * 0.8)))
+            drive.move_forward(push_speed)
+            time.sleep(duration_s)
+        finally:
+            drive.stop_motors()
 
     def _run(self) -> None:
         try:
-            # 1. Go to package
-            self._set_state("going_to_package")
-            if not self._navigate_to(self.package_qr, "package"):
+            self._abort.clear()
+            # 1. Open claw before package retrieval
+            self._set_state("opening_claw")
+            t = threading.Thread(target=self._claw_open, daemon=True)
+            t.start(); t.join()
+            if self._aborted():
+                self._reset_context()
                 self._set_state("idle")
                 return
 
-            # 2. Pick up
-            self._set_state("picking_up")
-            t = threading.Thread(target=self._claw_grab, daemon=True)
-            t.start(); t.join()
+            # 2. Go to package
+            self._set_state("going_to_package")
+            self._depart_base_forward()
+            if not self._navigate_to(
+                self.package_qr, "package", claw_mode=True, allow_reverse=False
+            ):
+                self._reset_context()
+                self._set_state("idle")
+                return
 
-            # 3. Return to base
+            # 3. Close claw to grab the package, then leave immediately
+            self._set_state("grabbing_package")
+            t = threading.Thread(target=self._claw_close, kwargs={"settle_s": 0.8}, daemon=True)
+            t.start(); t.join()
+            if self._aborted():
+                self._reset_context()
+                self._set_state("idle")
+                return
+
+            # 4. Return to base with the package
             self._set_state("returning_to_base")
             base_qr = self._reg.get("base")
-            if not base_qr or not self._navigate_to(base_qr, "base"):
+            if not base_qr or not self._navigate_to(base_qr, "base", force_reverse=True):
+                self._reset_context()
                 self._set_state("idle")
                 return
 
-            # 4. Wait for operator to select destination
+            # 5. Wait for operator to select destination
             self._set_state("awaiting_destination")
             self._dest_set.clear()
-            if not self._dest_set.wait(timeout=300.0) or not self.destination:
+            deadline = time.monotonic() + 300.0
+            dest_ready = False
+            while time.monotonic() < deadline:
+                if self._aborted():
+                    break
+                if self._dest_set.wait(timeout=0.1):
+                    dest_ready = True
+                    break
+            if self._aborted() or not dest_ready or not self.destination:
+                self._reset_context()
                 self._set_state("idle")
                 return
 
-            # 5. Go to station — stop when claw tip reaches station QR, not bot QR
+            # 6. Go to station — stop when claw tip reaches station QR, not bot QR
             self._set_state("going_to_station")
             dest_qr = self._reg.get(self.destination)
-            if not dest_qr or not self._navigate_to(dest_qr, self.destination, claw_mode=True):
+            drop_offset = self._reg.get_station_drop_offset(self.destination) if self.destination else None
+            self._clear_base_forward()
+            if not dest_qr or not self._navigate_to(
+                dest_qr, self.destination, claw_mode=True, claw_adjust_px=0,
+                allow_reverse=False, target_offset=drop_offset
+            ):
+                self._reset_context()
                 self._set_state("idle")
                 return
 
-            # 6. Drop off
+            # 7. Open claw to release at the station as soon as the claw reaches it
             self._set_state("dropping_off")
-            t = threading.Thread(target=self._claw_drop, daemon=True)
+            t = threading.Thread(target=self._claw_open, kwargs={"settle_s": 1.5}, daemon=True)
+            t.start(); t.join()
+            if self._aborted():
+                self._reset_context()
+                self._set_state("idle")
+                return
+
+            # 8. Return to base with the claw still open
+            self._set_state("returning_to_base_after_drop")
+            if not base_qr or not self._navigate_to(base_qr, "base", force_reverse=True):
+                self._reset_context()
+                self._set_state("idle")
+                return
+
+            # 9. Close claw once back at base
+            self._set_state("closing_claw")
+            t = threading.Thread(target=self._claw_close, daemon=True)
             t.start(); t.join()
 
+            self._reset_context()
             self._set_state("idle")
 
         except Exception as exc:
             log.error("Mission error: %s", exc, exc_info=True)
+            self._reset_context()
             self._set_state("idle")
 
     def start(self, package_qr: str) -> bool:
         if self.state != "idle":
             return False
+        self._abort.clear()
         self.package_qr  = package_qr
         self.destination = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="mission")
@@ -268,12 +489,40 @@ class MissionController:
         return True
 
     def abort(self) -> None:
+        if self._abort_thread and self._abort_thread.is_alive():
+            return
+        self._abort.set()
         self._nav.set_navigating(False)
-        self._arrived.set()
-        self._dest_set.set()
-        self.destination = None
-        self.state = "idle"
-        self._emit()
+        self._arrived.clear()
+        self._dest_set.clear()
+        self._abort_thread = threading.Thread(target=self._run_abort_recovery,
+                                              daemon=True, name="mission-abort")
+        self._abort_thread.start()
+
+    def _run_abort_recovery(self) -> None:
+        try:
+            mission_thread = self._thread
+            if mission_thread and mission_thread.is_alive():
+                mission_thread.join(timeout=2.0)
+
+            base_qr = self._reg.get("base")
+
+            if self._claw_is_open is not True:
+                self._set_state("dropping_off")
+                self._claw_open(settle_s=1.0)
+
+            self._abort.clear()
+            if base_qr:
+                self._set_state("returning_to_base_after_drop")
+                self._navigate_to(base_qr, "base", force_reverse=True)
+
+            self._set_state("closing_claw")
+            self._claw_close(settle_s=0.8)
+        finally:
+            self._abort.clear()
+            self._reset_context()
+            self.state = "idle"
+            self._emit()
 
 
 # ── FastAPI app + shared state ────────────────────────────────────────────────
@@ -313,7 +562,10 @@ def _make_payload() -> str:
         "nxt_connected":  _nxt_connected(),
         "package_qr":     _mission.package_qr if _mission else None,
         "destination":    _mission.destination if _mission else None,
+        "bot_aruco_id":   _registry.get_bot_aruco_id() if _registry else None,
+        "claw_center_offset_px": _registry.get_claw_center_offset_px() if _registry else None,
         "stations":          _registry.all() if _registry else {},
+        "station_drop_offsets": _registry.all_station_drop_offsets() if _registry else {},
         "test_target":       _test_target,
         "full_station_qrs":  list(s.full_station_qrs) if s else [],
     })
@@ -369,12 +621,15 @@ header h1{font-size:1.2rem;color:#a78bfa;margin-right:4px}
 .badge{padding:3px 11px;border-radius:20px;font-size:.75rem;font-weight:700;
   letter-spacing:.05em;text-transform:uppercase}
 .badge.idle{background:#2d2d2d;color:#888}
+.badge.opening_claw{background:#3a2600;color:#fb923c}
 .badge.going_to_package{background:#0e3a4a;color:#38bdf8}
-.badge.picking_up{background:#3a2600;color:#fb923c}
+.badge.grabbing_package{background:#3a2600;color:#fb923c}
 .badge.returning_to_base{background:#1e1040;color:#a78bfa}
 .badge.awaiting_destination{background:#2d2800;color:#fbbf24}
 .badge.going_to_station{background:#0e3a4a;color:#38bdf8}
 .badge.dropping_off{background:#3a2600;color:#fb923c}
+.badge.returning_to_base_after_drop{background:#1e1040;color:#a78bfa}
+.badge.closing_claw{background:#3a2600;color:#fb923c}
 .badge.searching{background:#0e3a4a;color:#38bdf8}
 .badge.centering{background:#3a2600;color:#fb923c}
 .badge.approaching{background:#0a2e0a;color:#4ade80}
@@ -436,6 +691,7 @@ button:disabled{opacity:.35;cursor:default}
 .btn-danger{background:#dc2626;color:#fff}
 .btn-warn{background:#d97706;color:#fff}
 .btn-neutral{background:#374151;color:#e8e8e8}
+.btn-secondary{background:#4b5563;color:#9ca3af;cursor:not-allowed}
 .btn-sm{padding:5px 10px;font-size:.72rem}
 /* log */
 #log-box{font-size:.7rem;color:#555;height:120px;overflow-y:auto;
@@ -479,6 +735,7 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
   <button class="tab-btn active" onclick="showTab('setup')">Setup</button>
   <button class="tab-btn" onclick="showTab('mission')">Mission Control</button>
   <button class="tab-btn" onclick="showTab('test')">Testing</button>
+  <button class="tab-btn" onclick="showTab('manual')">Manual Drive</button>
 </div>
 
 <!-- ─── SETUP TAB ─────────────────────────────────────────────────────────── -->
@@ -537,37 +794,60 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
     </div>
   </div>
 
-  <!-- Bot forward direction -->
+  <!-- Bot direction marker -->
   <div class="section" style="margin-top:14px;max-width:520px">
-    <h3>Bot forward direction</h3>
+    <h3>Bot Direction Marker (ArUco)</h3>
     <p style="font-size:.76rem;color:#666;margin-bottom:10px">
-      Place the bot so its <b>Bot QR</b> is visible in the camera, then draw an arrow
-      pointing toward the <b>front of the robot</b>. Required for overhead navigation.
+      Keep the <b>Bot QR</b> for robot identity, and mount an <b>ArUco marker</b> at the
+      front of the robot for direction. Generate one here, print it, mount it at the nose,
+      then save its ID.
     </p>
-    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
-      <button class="btn-warn" onclick="openDirModal()">Draw forward arrow</button>
+    <div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap">
+      <label style="font-size:.78rem;color:#888;display:flex;flex-direction:column;gap:3px">
+        ArUco ID
+        <input id="aruco-id" type="number" value="0" min="0" max="49" step="1"
+          style="width:100px;padding:5px 8px;border-radius:6px;border:1px solid #333;
+                 background:#111;color:#e8e8e8;font-size:.85rem">
+      </label>
+      <button class="btn-warn" onclick="generateAruco()">Generate PNG</button>
+      <button class="btn-primary" onclick="saveBotAruco()">Save as bot front</button>
+      <button class="btn-neutral btn-sm" onclick="clearBotAruco()">Clear</button>
+      <button class="btn-neutral btn-sm" onclick="refreshArucoInfo()">Refresh</button>
+    </div>
+    <div style="margin-top:8px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">
       <span style="font-size:.8rem;color:#666">
-        Current offset: <span id="setup-heading-offset" style="color:#e8e8e8;font-family:monospace">—</span>
+        Configured ID: <span id="setup-aruco-id" style="color:#e8e8e8;font-family:monospace">—</span>
+      </span>
+      <span style="font-size:.8rem;color:#666">
+        Visible IDs: <span id="setup-aruco-visible" style="color:#e8e8e8;font-family:monospace">—</span>
       </span>
     </div>
+    <div id="aruco-result" style="margin-top:8px;font-size:.78rem;color:#555;min-height:16px"></div>
   </div>
 
-  <!-- Background reference -->
   <div class="section" style="margin-top:14px;max-width:520px">
-    <h3>Background reference (obstacle detection)</h3>
+    <h3>Virtual Claw Center</h3>
     <p style="font-size:.76rem;color:#666;margin-bottom:10px">
-      Clear the arena of all movable objects, then click <b>Set Background</b>.
-      The system will flag and avoid any foreign objects that appear in the robot's path.
-      <span style="color:#888">Red × markers on camera = detected obstacles.</span>
+      Click the actual <b>claw centre</b> in the camera image while the <b>bot QR</b> and
+      configured <b>front ArUco</b> are visible. The system stores the projected pixel
+      distance from the ArUco centre along the bot's forward axis.
     </p>
-    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
-      <button class="btn-primary" onclick="setBackground()">Set Background</button>
-      <button class="btn-neutral btn-sm" onclick="clearBackground()">Clear</button>
+    <div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap">
+      <button class="btn-primary" onclick="openClawCenterModal()">📍 Set Claw Center</button>
+      <button class="btn-neutral btn-sm" onclick="refreshClawCenterInfo()">Refresh</button>
+      <button class="btn-neutral btn-sm" onclick="clearClawCenterOffset()">Clear</button>
+    </div>
+    <div style="margin-top:8px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">
       <span style="font-size:.8rem;color:#666">
-        Status: <span id="setup-bg-status" style="font-family:monospace">checking…</span>
+        Configured offset: <span id="setup-claw-center-offset" style="color:#e8e8e8;font-family:monospace">not set</span>
+      </span>
+      <span style="font-size:.8rem;color:#666">
+        Forward axis: <span id="setup-claw-center-axis" style="color:#e8e8e8;font-family:monospace">—</span>
       </span>
     </div>
+    <div id="claw-center-result" style="margin-top:8px;font-size:.78rem;color:#555;min-height:16px"></div>
   </div>
+
 </div>
 
 <!-- ─── MISSION TAB ───────────────────────────────────────────────────────── -->
@@ -595,12 +875,15 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
       <!-- State flow -->
       <div class="flow" id="state-flow">
         <div class="flow-step" id="fs-idle">Idle</div>
+        <div class="flow-step" id="fs-opening_claw">Open Claw</div>
         <div class="flow-step" id="fs-going_to_package">→ Package</div>
-        <div class="flow-step" id="fs-picking_up">Grab</div>
+        <div class="flow-step" id="fs-grabbing_package">Close Claw</div>
         <div class="flow-step" id="fs-returning_to_base">→ Base</div>
         <div class="flow-step" id="fs-awaiting_destination">Dest?</div>
         <div class="flow-step" id="fs-going_to_station">→ Station</div>
-        <div class="flow-step" id="fs-dropping_off">Drop</div>
+        <div class="flow-step" id="fs-dropping_off">Open Claw</div>
+        <div class="flow-step" id="fs-returning_to_base_after_drop">→ Base</div>
+        <div class="flow-step" id="fs-closing_claw">Close Claw</div>
       </div>
 
       <!-- Detected packages -->
@@ -683,6 +966,64 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
   </div>
 </div>
 
+<!-- ─── MANUAL DRIVE TAB ─────────────────────────────────────────────── -->
+<div id="tab-manual" class="tab-pane">
+  <div style="display:grid;grid-template-columns:1fr 340px;gap:16px">
+
+    <!-- Left: camera feed -->
+    <div>
+      <div class="camera-main"><img src="/stream" alt="camera feed"></div>
+    </div>
+
+    <!-- Right: controls -->
+    <div style="display:flex;flex-direction:column;gap:12px">
+
+      <div class="section">
+        <h3>Speed</h3>
+        <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+          <input type="range" id="manual-speed" min="20" max="100" value="60" style="flex:1"
+            oninput="document.getElementById('manual-spd-val').textContent=this.value">
+          <span id="manual-spd-val" style="font-family:monospace;color:#a78bfa;min-width:28px">60</span>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Drive (hold to move)</h3>
+        <div style="display:grid;grid-template-columns:repeat(3,58px);grid-template-rows:repeat(3,54px);
+                    gap:5px;margin-top:8px;user-select:none;-webkit-user-select:none">
+          <div></div>
+          <button class="btn-primary" id="mbtn-fwd"   style="font-size:1.3rem;touch-action:none">↑</button>
+          <div></div>
+          <button class="btn-neutral" id="mbtn-left"  style="font-size:1.3rem;touch-action:none">←</button>
+          <button class="btn-danger"  id="mbtn-stop"  style="font-size:1rem;touch-action:none">■</button>
+          <button class="btn-neutral" id="mbtn-right" style="font-size:1.3rem;touch-action:none">→</button>
+          <div></div>
+          <button class="btn-warn"    id="mbtn-back"  style="font-size:1.3rem;touch-action:none">↓</button>
+          <div></div>
+        </div>
+        <p style="font-size:.72rem;color:#555;margin-top:8px">Hold = drive · release = stop</p>
+      </div>
+
+      <div class="section">
+        <h3>Motor output</h3>
+        <div class="stat-row" style="margin-top:6px">
+          <span class="stat-label">Left</span>
+          <span id="manual-L" class="stat-val" style="font-family:monospace">0</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Right</span>
+          <span id="manual-R" class="stat-val" style="font-family:monospace">0</span>
+        </div>
+        <div class="stat-row" style="margin-top:6px">
+          <span class="stat-label">Status</span>
+          <span id="manual-status" class="stat-val" style="color:#555">stopped</span>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
 <!-- ─── PARKING MODAL ──────────────────────────────────────────────────── -->
 <div id="park-modal" style="display:none;position:fixed;inset:0;
   background:rgba(0,0,0,.88);z-index:1000;justify-content:center;align-items:center">
@@ -705,6 +1046,59 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
         Save position
       </button>
       <button class="btn-neutral btn-sm" onclick="closeParkModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ─── STATION DROP MODAL ─────────────────────────────────────────────── -->
+<div id="station-drop-modal" style="display:none;position:fixed;inset:0;
+  background:rgba(0,0,0,.88);z-index:1000;justify-content:center;align-items:center">
+  <div style="background:#1a1a2e;border-radius:12px;padding:20px;
+    max-width:95vw;max-height:95vh;display:flex;flex-direction:column;gap:12px;
+    border:2px solid #16a34a">
+    <h2 id="station-drop-title" style="color:#4ade80;font-size:1rem;margin:0">Set Station Drop Target</h2>
+    <p style="font-size:.78rem;color:#888;margin:0">
+      Click the spot where the <b style="color:#fb923c">claw centre</b> should align when dropping.
+      Green box = station QR. Orange circle = current saved drop point.
+    </p>
+    <div style="overflow:auto;border-radius:6px;background:#111">
+      <canvas id="station-drop-canvas" style="max-width:80vw;cursor:crosshair;display:block"></canvas>
+    </div>
+    <div id="station-drop-status" style="font-size:.78rem;color:#fb923c;min-height:14px"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn-neutral btn-sm" onclick="refreshStationDropFrame()">Refresh frame</button>
+      <button class="btn-success btn-sm" id="station-drop-confirm" onclick="confirmStationDrop()" disabled>
+        Save drop target
+      </button>
+      <button class="btn-neutral btn-sm" onclick="clearStationDrop()">Clear</button>
+      <button class="btn-neutral btn-sm" onclick="closeStationDropModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ─── CLAW CENTER MODAL ──────────────────────────────────────────────── -->
+<div id="claw-center-modal" style="display:none;position:fixed;inset:0;
+  background:rgba(0,0,0,.88);z-index:1000;justify-content:center;align-items:center">
+  <div style="background:#1a1a2e;border-radius:12px;padding:20px;
+    max-width:95vw;max-height:95vh;display:flex;flex-direction:column;gap:12px;
+    border:2px solid #f59e0b">
+    <h2 style="color:#f59e0b;font-size:1rem;margin:0">Set Virtual Claw Center</h2>
+    <p style="font-size:.78rem;color:#888;margin:0">
+      Click the real <b style="color:#38bdf8">claw centre</b>. The orange point is the current
+      saved position, measured from the <b style="color:#fde047">ArUco centre</b> along the
+      <b style="color:#4ade80">forward axis</b> from the bot QR to the ArUco.
+    </p>
+    <div style="overflow:auto;border-radius:6px;background:#111">
+      <canvas id="claw-center-canvas" style="max-width:80vw;cursor:crosshair;display:block"></canvas>
+    </div>
+    <div id="claw-center-status" style="font-size:.78rem;color:#fb923c;min-height:14px"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn-neutral btn-sm" onclick="refreshClawCenterFrame()">Refresh frame</button>
+      <button class="btn-success btn-sm" id="claw-center-confirm" onclick="confirmClawCenter()" disabled>
+        Save claw center
+      </button>
+      <button class="btn-neutral btn-sm" onclick="clearClawCenterOffset()">Clear</button>
+      <button class="btn-neutral btn-sm" onclick="closeClawCenterModal()">Cancel</button>
     </div>
   </div>
 </div>
@@ -739,10 +1133,12 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
 <script>
 const STATION_KEYS   = ['bot','base','station_1','station_2','station_3'];
 const STATION_LABELS = {bot:'Bot',base:'Base',station_1:'Station 1',station_2:'Station 2',station_3:'Station 3'};
-const FLOW_STATES    = ['idle','going_to_package','picking_up','returning_to_base',
-                        'awaiting_destination','going_to_station','dropping_off'];
+const FLOW_STATES    = ['idle','opening_claw','going_to_package','grabbing_package','returning_to_base',
+                        'awaiting_destination','going_to_station','dropping_off',
+                        'returning_to_base_after_drop','closing_claw'];
 
 let stationsData   = {};
+let stationDropOffsets = {};
 let allQrPayloads  = [];
 let missionState   = 'idle';
 let fullStationKeys = new Set();  // station keys (station_1 etc.) currently full
@@ -814,8 +1210,10 @@ function esc(s) {
 // ── full state update ─────────────────────────────────────────────────────────
 function applyState(s) {
   stationsData  = s.stations || {};
+  stationDropOffsets = s.station_drop_offsets || {};
   allQrPayloads = s.all_qr_payloads || [];
   missionState  = s.mission_state || 'idle';
+  const clawCenterOffset = s.claw_center_offset_px;
 
   // Map full QR payloads → station keys
   const fullQRs = new Set(s.full_station_qrs || []);
@@ -857,6 +1255,11 @@ function applyState(s) {
   document.getElementById('t-target').textContent = s.test_target || '—';
   document.getElementById('t-area').textContent   = s.qr_area_pct != null ? s.qr_area_pct + ' %' : '—';
 
+  const clawOffsetEl = document.getElementById('setup-claw-center-offset');
+  if (clawOffsetEl) {
+    clawOffsetEl.textContent = clawCenterOffset != null ? `${Number(clawCenterOffset).toFixed(1)} px` : 'not set';
+  }
+
   renderStations();
   renderTestButtons();
   renderTestQRButtons();
@@ -878,11 +1281,16 @@ function renderStations() {
     if (key === 'base') {
       extra = `<button class="btn-neutral btn-sm" onclick="generateBaseQR()" title="Generate and print base QR">⚙ Generate</button>`;
     }
+    if (key.startsWith('station_')) {
+      const hasDrop = !!stationDropOffsets[key];
+      extra += ` <button class="btn-neutral btn-sm" onclick="openStationDropModal('${key}')"${qr?'':' disabled'}>${hasDrop ? '🎯 Edit Drop' : '🎯 Set Drop'}</button>`;
+    }
 
     const isFull = fullStationKeys.has(key);
     row.innerHTML = `
       <span class="label">${STATION_LABELS[key]}</span>
       ${isFull ? '<span class="badge" style="background:#7f1d1d;color:#fca5a5;font-size:.65rem">FULL</span>' : ''}
+      ${(key.startsWith('station_') && stationDropOffsets[key]) ? '<span class="badge" style="background:#0a2e0a;color:#4ade80;font-size:.65rem">DROP SET</span>' : ''}
       <span class="qr-val ${qr ? '' : 'empty'}">${qr ? esc(qr) : 'not set'}</span>
       ${extra}
       <button class="btn-primary btn-sm" onclick="scanStation('${key}')">Scan</button>
@@ -891,15 +1299,15 @@ function renderStations() {
     list.appendChild(row);
   });
 
-  const required = STATION_KEYS.filter(k => k !== 'bot');
-  const allSet   = required.every(k => stationsData[k]);
+  const baseOk   = !!stationsData['base'];
   const botOk    = !!stationsData['bot'];
+  const stCount  = ['station_1','station_2','station_3'].filter(k => stationsData[k]).length;
   const status   = document.getElementById('setup-status');
   const modeNote = botOk ? ' [overhead mode]' : ' [onboard mode — add Bot QR for overhead]';
-  status.textContent = allSet
-    ? '✓ Stations registered — ready for missions.' + modeNote
-    : 'Scan QR codes for each station above.' + modeNote;
-  status.className = 'setup-status' + (allSet ? ' ok' : '');
+  status.textContent = baseOk
+    ? `✓ Base registered — ${stCount}/3 station(s) set. Missions ready.` + modeNote
+    : 'Register Base QR to enable missions. Stations are optional.' + modeNote;
+  status.className = 'setup-status' + (baseOk ? ' ok' : '');
 }
 
 async function generateBaseQR() {
@@ -945,6 +1353,10 @@ async function assignStation(key, qr) {
     stationsData[key] = qr;
     addLog(`${STATION_LABELS[key]} → "${qr}"`);
     renderStations();
+    if (key === 'bot') {
+      refreshArucoInfo();
+      refreshClawCenterInfo();
+    }
   } else {
     addLog('Assign failed: ' + d.reason);
   }
@@ -959,6 +1371,10 @@ async function clearStation(key) {
     stationsData[key] = null;
     addLog(`${STATION_LABELS[key]} cleared`);
     renderStations();
+    if (key === 'bot') {
+      refreshArucoInfo();
+      refreshClawCenterInfo();
+    }
   }
 }
 
@@ -996,7 +1412,14 @@ async function switchCamera() {
     });
     const d = await r.json();
     addLog(d.ok ? `Camera switched to index ${idx}` : 'Camera switch failed: ' + d.reason);
-    if (!d.ok) await loadCameras();
+    if (d.ok) {
+      document.querySelectorAll('img[src*="/stream"]').forEach(img => {
+        img.src = '';
+        setTimeout(() => { img.src = '/stream'; }, 300);
+      });
+    } else {
+      await loadCameras();
+    }
   } catch(e) {
     addLog('Camera switch request failed');
   }
@@ -1063,17 +1486,69 @@ async function testStop() {
   addLog((await r.json()).ok ? 'Testing: motors stopped' : 'Stop failed');
 }
 
+// ── manual drive ──────────────────────────────────────────────────────────────
+function _manualSpd() { return parseInt(document.getElementById('manual-speed').value) || 60; }
+
+function _manualSetDisplay(l, r) {
+  document.getElementById('manual-L').textContent = l;
+  document.getElementById('manual-R').textContent = r;
+  document.getElementById('manual-status').textContent = (l !== 0 || r !== 0) ? 'driving' : 'stopped';
+  document.getElementById('manual-status').style.color = (l !== 0 || r !== 0) ? '#4ade80' : '#555';
+}
+
+async function _manualSend(left, right) {
+  _manualSetDisplay(left, right);
+  try {
+    await fetch('/api/manual/drive', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({left, right})
+    });
+  } catch(e) {}
+}
+
+async function _manualStopSend() {
+  _manualSetDisplay(0, 0);
+  try { await fetch('/api/manual/stop', {method:'POST'}); } catch(e) {}
+}
+
+function _setupManualBtn(id, lFn, rFn) {
+  const btn = document.getElementById(id);
+  if (!btn) return;
+  const go   = () => { const s=_manualSpd(); _manualSend(lFn(s), rFn(s)); };
+  const halt = () => _manualStopSend();
+  btn.addEventListener('mousedown',  go);
+  btn.addEventListener('mouseup',    halt);
+  btn.addEventListener('mouseleave', halt);
+  btn.addEventListener('touchstart', e => { e.preventDefault(); go(); },   {passive:false});
+  btn.addEventListener('touchend',   e => { e.preventDefault(); halt(); }, {passive:false});
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  _setupManualBtn('mbtn-fwd',   s => s,   s => s);   // forward
+  _setupManualBtn('mbtn-back',  s => -s,  s => -s);  // backward
+  _setupManualBtn('mbtn-left',  s => -s,  s => s);   // spin left
+  _setupManualBtn('mbtn-right', s => s,   s => -s);  // spin right
+  const stopBtn = document.getElementById('mbtn-stop');
+  if (stopBtn) stopBtn.addEventListener('click', _manualStopSend);
+});
+
 // ── destination buttons ───────────────────────────────────────────────────────
 function renderDestButtons() {
   const grid = document.getElementById('dest-grid');
   if (!grid) return;
   grid.innerHTML = '';
   ['station_1','station_2','station_3'].forEach(key => {
+    const registered = !!stationsData[key];
     const full = fullStationKeys.has(key);
     const btn  = document.createElement('button');
-    btn.className = full ? 'btn-danger' : 'btn-success';
-    btn.textContent = STATION_LABELS[key] + (full ? ' (FULL)' : '');
-    btn.disabled = (missionState !== 'awaiting_destination') || full;
+    if (!registered) {
+      btn.className = 'btn-secondary';
+      btn.textContent = STATION_LABELS[key] + ' (not set)';
+    } else {
+      btn.className = full ? 'btn-danger' : 'btn-success';
+      btn.textContent = STATION_LABELS[key] + (full ? ' (FULL)' : '');
+    }
+    btn.disabled = (missionState !== 'awaiting_destination') || full || !registered;
     btn.onclick  = () => selectDest(key);
     grid.appendChild(btn);
   });
@@ -1133,6 +1608,14 @@ setInterval(async () => {
     applyNxt(d.connected);
   } catch(_){}
 }, 3000);
+
+// State polling fallback — keeps packages/stations live without WebSocket
+setInterval(async () => {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    applyState(s);
+  } catch(_){}
+}, 2000);
 
 // ── parking modal ─────────────────────────────────────────────────────────────
 let _parkInfo  = null;   // base QR info from server
@@ -1265,9 +1748,433 @@ function _applyParkingOffset(off) {
   el.textContent = off ? `(${off.dx.toFixed(0)}, ${off.dy.toFixed(0)}) px` : 'not set';
 }
 
+// ── ArUco setup ───────────────────────────────────────────────────────────────
+function _applyArucoInfo(info) {
+  const configured = document.getElementById('setup-aruco-id');
+  const visible = document.getElementById('setup-aruco-visible');
+  const input = document.getElementById('aruco-id');
+  const result = document.getElementById('aruco-result');
+  if (configured) configured.textContent = info.configured_id != null ? String(info.configured_id) : 'not set';
+  if (visible) {
+    visible.textContent = info.visible_ids && info.visible_ids.length ? info.visible_ids.join(', ') : 'none';
+  }
+  if (input && info.configured_id != null) input.value = info.configured_id;
+  if (result) {
+    result.style.color = info.found ? '#4ade80' : '#555';
+    result.textContent = info.found
+      ? `Configured marker ${info.configured_id} is visible and locked to bot heading.`
+      : (info.reason || 'No configured ArUco marker visible.');
+  }
+}
+
+async function refreshArucoInfo() {
+  try {
+    const info = await (await fetch('/api/setup/aruco-info')).json();
+    _applyArucoInfo(info);
+  } catch(_) {}
+}
+
+async function saveBotAruco() {
+  const id = parseInt(document.getElementById('aruco-id').value, 10);
+  const result = document.getElementById('aruco-result');
+  if (isNaN(id) || id < 0 || id > 49) {
+    result.style.color = '#ef4444';
+    result.textContent = 'ArUco ID must be between 0 and 49.';
+    return;
+  }
+  const r = await fetch('/api/setup/aruco-config', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id})
+  });
+  const d = await r.json();
+  result.style.color = d.ok ? '#4ade80' : '#ef4444';
+  result.textContent = d.ok ? `Bot front ArUco set to ID ${id}.` : ('✗ ' + d.reason);
+  if (d.ok) {
+    addLog(`Bot front ArUco set to ID ${id}`);
+    refreshArucoInfo();
+    refreshClawCenterInfo();
+  }
+}
+
+async function clearBotAruco() {
+  const r = await fetch('/api/setup/aruco-clear', {method:'POST'});
+  const d = await r.json();
+  const result = document.getElementById('aruco-result');
+  result.style.color = d.ok ? '#4ade80' : '#ef4444';
+  result.textContent = d.ok ? 'Bot front ArUco cleared.' : ('✗ ' + d.reason);
+  if (d.ok) {
+    addLog('Bot front ArUco cleared');
+    refreshArucoInfo();
+    refreshClawCenterInfo();
+  }
+}
+
+async function generateAruco() {
+  const id = parseInt(document.getElementById('aruco-id').value, 10);
+  const result = document.getElementById('aruco-result');
+  if (isNaN(id) || id < 0 || id > 49) {
+    result.style.color = '#ef4444';
+    result.textContent = 'ArUco ID must be between 0 and 49.';
+    return;
+  }
+  const r = await fetch('/api/setup/generate-aruco', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id})
+  });
+  const d = await r.json();
+  result.style.color = d.ok ? '#4ade80' : '#ef4444';
+  result.textContent = d.ok
+    ? `Generated ArUco ID ${id} at ${d.path}`
+    : ('✗ ' + d.reason);
+  if (d.ok) {
+    addLog(`Generated ArUco ID ${id} → ${d.path}`);
+  }
+}
+
+// ── claw center setup ────────────────────────────────────────────────────────
+let _clawCenterInfo  = null;
+let _clawCenterClick = null;
+let _clawCenterImgEl = null;
+
+function _drawClawCenterCanvas() {
+  const canvas = document.getElementById('claw-center-canvas');
+  if (!_clawCenterImgEl) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width  = _clawCenterImgEl.naturalWidth;
+  canvas.height = _clawCenterImgEl.naturalHeight;
+  ctx.drawImage(_clawCenterImgEl, 0, 0);
+
+  if (!_clawCenterInfo || !_clawCenterInfo.found) {
+    ctx.fillStyle = '#ff4444';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.fillText('Bot QR / ArUco not detected — refresh or check setup.', 16, 36);
+    return;
+  }
+
+  const {bot_x, bot_y, bot_w, bot_h, bot_cx, bot_cy, aruco_cx, aruco_cy, axis_dx, axis_dy, offset_px} = _clawCenterInfo;
+  ctx.strokeStyle = '#00ff88';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(bot_x, bot_y, bot_w, bot_h);
+  ctx.fillStyle = '#00ff88';
+  ctx.beginPath();
+  ctx.arc(bot_cx, bot_cy, 5, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = '#fde047';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(aruco_cx, aruco_cy, 11, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(bot_cx, bot_cy);
+  ctx.lineTo(aruco_cx, aruco_cy);
+  ctx.stroke();
+
+  ctx.strokeStyle = '#4ade80';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(aruco_cx, aruco_cy);
+  ctx.lineTo(aruco_cx + axis_dx * 140, aruco_cy + axis_dy * 140);
+  ctx.stroke();
+
+  if (offset_px != null) {
+    const px = aruco_cx + axis_dx * offset_px;
+    const py = aruco_cy + axis_dy * offset_px;
+    ctx.fillStyle = '#ff8c00';
+    ctx.beginPath();
+    ctx.arc(px, py, 10, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(px, py, 10, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = '#ff8c00';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.fillText('current', px + 14, py + 5);
+  }
+
+  if (_clawCenterClick) {
+    ctx.fillStyle = '#38bdf8';
+    ctx.beginPath();
+    ctx.arc(_clawCenterClick.x, _clawCenterClick.y, 10, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(_clawCenterClick.x, _clawCenterClick.y, 10, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.fillText('new', _clawCenterClick.x + 14, _clawCenterClick.y + 5);
+  }
+}
+
+function _applyClawCenterInfo(info) {
+  const offsetEl = document.getElementById('setup-claw-center-offset');
+  const axisEl = document.getElementById('setup-claw-center-axis');
+  const resultEl = document.getElementById('claw-center-result');
+  if (offsetEl) {
+    offsetEl.textContent = info.offset_px != null ? `${Number(info.offset_px).toFixed(1)} px` : 'not set';
+  }
+  if (axisEl) {
+    axisEl.textContent = info.found
+      ? `${Number(info.axis_dx).toFixed(3)}, ${Number(info.axis_dy).toFixed(3)}`
+      : '—';
+  }
+  if (resultEl) {
+    resultEl.style.color = info.found ? '#4ade80' : '#555';
+    resultEl.textContent = info.found
+      ? 'Bot QR and front ArUco are visible. You can calibrate the claw center from this view.'
+      : (info.reason || 'Bot QR and configured ArUco must both be visible.');
+  }
+}
+
+async function refreshClawCenterInfo() {
+  try {
+    const info = await (await fetch('/api/setup/claw-center-info')).json();
+    _applyClawCenterInfo(info);
+  } catch(_) {}
+}
+
+async function openClawCenterModal() {
+  _clawCenterClick = null;
+  document.getElementById('claw-center-modal').style.display = 'flex';
+  document.getElementById('claw-center-status').textContent = 'Loading…';
+  document.getElementById('claw-center-confirm').disabled = true;
+  await refreshClawCenterFrame();
+}
+
+async function refreshClawCenterFrame() {
+  const [infoRes, imgUrl] = await Promise.all([
+    fetch('/api/setup/claw-center-info').then(r => r.json()),
+    Promise.resolve('/api/setup/snapshot?' + Date.now()),
+  ]);
+  _clawCenterInfo = infoRes;
+  _applyClawCenterInfo(infoRes);
+  const status = document.getElementById('claw-center-status');
+  if (!infoRes.found) {
+    status.textContent = '⚠ ' + (infoRes.reason || 'Bot QR / ArUco not found');
+  } else {
+    status.textContent = infoRes.offset_px != null
+      ? `Current claw center offset: ${Number(infoRes.offset_px).toFixed(1)} px from ArUco centre along forward axis`
+      : 'No claw center set — click the claw center to calibrate it.';
+  }
+
+  const img = new Image();
+  img.onload = () => { _clawCenterImgEl = img; _drawClawCenterCanvas(); };
+  img.src = imgUrl;
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('claw-center-canvas').addEventListener('click', e => {
+    if (!_clawCenterInfo || !_clawCenterInfo.found) return;
+    const canvas = document.getElementById('claw-center-canvas');
+    const rect   = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    _clawCenterClick = {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY,
+    };
+    _drawClawCenterCanvas();
+    const relX = _clawCenterClick.x - _clawCenterInfo.aruco_cx;
+    const relY = _clawCenterClick.y - _clawCenterInfo.aruco_cy;
+    const offsetPx = relX * _clawCenterInfo.axis_dx + relY * _clawCenterInfo.axis_dy;
+    const lateralPx = -relX * _clawCenterInfo.axis_dy + relY * _clawCenterInfo.axis_dx;
+    document.getElementById('claw-center-confirm').disabled = false;
+    document.getElementById('claw-center-status').textContent =
+      `Projected offset ${offsetPx.toFixed(1)} px, lateral miss ${lateralPx.toFixed(1)} px — click Save to confirm.`;
+  });
+});
+
+async function confirmClawCenter() {
+  if (!_clawCenterInfo || !_clawCenterInfo.found || !_clawCenterClick) return;
+  const relX = _clawCenterClick.x - _clawCenterInfo.aruco_cx;
+  const relY = _clawCenterClick.y - _clawCenterInfo.aruco_cy;
+  const offsetPx = relX * _clawCenterInfo.axis_dx + relY * _clawCenterInfo.axis_dy;
+  const lateralPx = -relX * _clawCenterInfo.axis_dy + relY * _clawCenterInfo.axis_dx;
+  const r = await fetch('/api/setup/claw-center', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({offset_px: offsetPx}),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    addLog(`Claw center saved at ${offsetPx.toFixed(1)} px from ArUco (lateral miss ${lateralPx.toFixed(1)} px)`);
+    closeClawCenterModal();
+    refreshClawCenterInfo();
+  } else {
+    document.getElementById('claw-center-status').textContent = 'Error: ' + d.reason;
+  }
+}
+
+async function clearClawCenterOffset() {
+  const r = await fetch('/api/setup/claw-center/clear', {method: 'POST'});
+  const d = await r.json();
+  if (d.ok) {
+    addLog('Claw center calibration cleared');
+    _applyClawCenterInfo({found: false, reason: 'Claw center cleared.', offset_px: null});
+    if (document.getElementById('claw-center-modal').style.display === 'flex') {
+      document.getElementById('claw-center-status').textContent = 'Claw center cleared.';
+      document.getElementById('claw-center-confirm').disabled = true;
+    }
+  } else {
+    const status = document.getElementById('claw-center-status');
+    if (status) status.textContent = 'Error: ' + d.reason;
+  }
+}
+
+function closeClawCenterModal() {
+  document.getElementById('claw-center-modal').style.display = 'none';
+  _clawCenterInfo = null;
+  _clawCenterClick = null;
+  _clawCenterImgEl = null;
+}
+
 function closeParkModal() {
   document.getElementById('park-modal').style.display = 'none';
   _parkClick = null; _parkInfo = null; _parkImgEl = null;
+}
+
+// ── station drop modal ───────────────────────────────────────────────────────
+let _stationDropKey   = null;
+let _stationDropInfo  = null;
+let _stationDropClick = null;
+let _stationDropImgEl = null;
+
+function _drawStationDropCanvas() {
+  const canvas = document.getElementById('station-drop-canvas');
+  if (!_stationDropImgEl) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width  = _stationDropImgEl.naturalWidth;
+  canvas.height = _stationDropImgEl.naturalHeight;
+  ctx.drawImage(_stationDropImgEl, 0, 0);
+
+  if (!_stationDropInfo || !_stationDropInfo.found) {
+    ctx.fillStyle = '#ff4444';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.fillText('Station QR not detected — refresh or check camera.', 16, 36);
+    return;
+  }
+
+  const {cx, cy, x, y, w, h, offset} = _stationDropInfo;
+  ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 3;
+  ctx.strokeRect(x, y, w, h);
+  ctx.fillStyle = '#00ff88';
+  ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI*2); ctx.fill();
+
+  if (offset) {
+    const px = cx + offset.dx, py = cy + offset.dy;
+    ctx.fillStyle = '#ff8c00';
+    ctx.beginPath(); ctx.arc(px, py, 10, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(px, py, 10, 0, Math.PI*2); ctx.stroke();
+    ctx.fillStyle = '#ff8c00'; ctx.font = 'bold 12px sans-serif';
+    ctx.fillText('current', px + 14, py + 5);
+  }
+
+  if (_stationDropClick) {
+    ctx.fillStyle = '#38bdf8';
+    ctx.beginPath(); ctx.arc(_stationDropClick.x, _stationDropClick.y, 10, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(_stationDropClick.x, _stationDropClick.y, 10, 0, Math.PI*2); ctx.stroke();
+    ctx.fillStyle = '#38bdf8'; ctx.font = 'bold 12px sans-serif';
+    ctx.fillText('new', _stationDropClick.x + 14, _stationDropClick.y + 5);
+  }
+}
+
+async function openStationDropModal(station) {
+  _stationDropKey = station;
+  _stationDropClick = null;
+  document.getElementById('station-drop-modal').style.display = 'flex';
+  document.getElementById('station-drop-title').textContent = `Set ${STATION_LABELS[station]} Drop Target`;
+  document.getElementById('station-drop-status').textContent = 'Loading…';
+  document.getElementById('station-drop-confirm').disabled = true;
+  await refreshStationDropFrame();
+}
+
+async function refreshStationDropFrame() {
+  if (!_stationDropKey) return;
+  const [infoRes, imgUrl] = await Promise.all([
+    fetch('/api/setup/station-drop-info?station=' + encodeURIComponent(_stationDropKey)).then(r => r.json()),
+    Promise.resolve('/api/setup/snapshot?' + Date.now()),
+  ]);
+  _stationDropInfo = infoRes;
+  const status = document.getElementById('station-drop-status');
+  if (!infoRes.found) {
+    status.textContent = '⚠ ' + (infoRes.reason || 'Station QR not found');
+  } else {
+    const off = infoRes.offset;
+    status.textContent = off
+      ? `Current drop offset: (${off.dx}, ${off.dy}) px from station QR centre`
+      : 'No drop target set — click to place one.';
+  }
+  const img = new Image();
+  img.onload = () => { _stationDropImgEl = img; _drawStationDropCanvas(); };
+  img.src = imgUrl;
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('station-drop-canvas').addEventListener('click', e => {
+    if (!_stationDropInfo || !_stationDropInfo.found) return;
+    const canvas = document.getElementById('station-drop-canvas');
+    const rect   = canvas.getBoundingClientRect();
+    const scaleX = canvas.width  / rect.width;
+    const scaleY = canvas.height / rect.height;
+    _stationDropClick = {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top)  * scaleY,
+    };
+    _drawStationDropCanvas();
+    document.getElementById('station-drop-confirm').disabled = false;
+    document.getElementById('station-drop-status').textContent =
+      'New drop target set — click Save to confirm.';
+  });
+});
+
+async function confirmStationDrop() {
+  if (!_stationDropKey || !_stationDropClick || !_stationDropInfo || !_stationDropInfo.found) return;
+  const dx = _stationDropClick.x - _stationDropInfo.cx;
+  const dy = _stationDropClick.y - _stationDropInfo.cy;
+  const r = await fetch('/api/setup/station-drop', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({station: _stationDropKey, dx, dy}),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    stationDropOffsets[_stationDropKey] = {dx, dy};
+    addLog(`${STATION_LABELS[_stationDropKey]} drop target saved (${dx.toFixed(0)}, ${dy.toFixed(0)} px)`);
+    renderStations();
+    closeStationDropModal();
+  } else {
+    document.getElementById('station-drop-status').textContent = 'Error: ' + d.reason;
+  }
+}
+
+async function clearStationDrop() {
+  if (!_stationDropKey) return;
+  const r = await fetch('/api/setup/station-drop/clear', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({station: _stationDropKey}),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    delete stationDropOffsets[_stationDropKey];
+    addLog(`${STATION_LABELS[_stationDropKey]} drop target cleared`);
+    renderStations();
+    closeStationDropModal();
+  } else {
+    document.getElementById('station-drop-status').textContent = 'Error: ' + d.reason;
+  }
+}
+
+function closeStationDropModal() {
+  document.getElementById('station-drop-modal').style.display = 'none';
+  _stationDropKey = null;
+  _stationDropInfo = null;
+  _stationDropClick = null;
+  _stationDropImgEl = null;
 }
 
 // ── direction modal ───────────────────────────────────────────────────────────
@@ -1418,37 +2325,6 @@ async function calibrateScale() {
   }
 }
 
-// ── background subtraction ────────────────────────────────────────────────────
-async function setBackground() {
-  const el = document.getElementById('setup-bg-status');
-  el.textContent = 'capturing…';
-  el.style.color = '#fb923c';
-  try {
-    const d = await (await fetch('/api/setup/set-background', {method:'POST'})).json();
-    if (d.ok) {
-      el.textContent = 'set';
-      el.style.color = '#4ade80';
-      addLog('Background reference captured — obstacle detection active');
-    } else {
-      el.textContent = 'failed: ' + d.reason;
-      el.style.color = '#ef4444';
-    }
-  } catch(e) {
-    el.textContent = 'error';
-    el.style.color = '#ef4444';
-  }
-}
-
-async function clearBackground() {
-  const d = await (await fetch('/api/setup/clear-background', {method:'POST'})).json();
-  const el = document.getElementById('setup-bg-status');
-  if (d.ok) {
-    el.textContent = 'not set';
-    el.style.color = '#555';
-    addLog('Background reference cleared — obstacle detection off');
-  }
-}
-
 // Bootstrap
 (async () => {
   try {
@@ -1457,19 +2333,11 @@ async function clearBackground() {
   } catch(_) {}
   loadCameras();
   try {
-    const info = await (await fetch('/api/setup/bot-qr-info')).json();
-    if (info.current_offset != null)
-      _applyHeadingOffset(parseFloat((info.current_offset * 180 / Math.PI).toFixed(1)));
-  } catch(_) {}
-  try {
     const pinfo = await (await fetch('/api/setup/base-parking-info')).json();
     if (pinfo.offset) _applyParkingOffset(pinfo.offset);
   } catch(_) {}
-  try {
-    const bg = await (await fetch('/api/setup/bg-status')).json();
-    const el = document.getElementById('setup-bg-status');
-    if (el) { el.textContent = bg.set ? 'set' : 'not set'; el.style.color = bg.set ? '#4ade80' : '#555'; }
-  } catch(_) {}
+  refreshArucoInfo();
+  refreshClawCenterInfo();
   connectWS();
 })();
 </script>
@@ -1499,16 +2367,21 @@ async def dashboard():
 async def stream():
     def generate():
         while True:
-            sq = _registry.qr_set() if _registry else set()
-            frame = _navigator.get_annotated_frame(station_qrs=sq) if _navigator else None
-            if frame is None:
-                frame = _placeholder_frame()
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            if not ok:
+            try:
+                sq = _registry.qr_set() if _registry else set()
+                frame = _navigator.get_annotated_frame(station_qrs=sq) if _navigator else None
+                if frame is None:
+                    frame = _placeholder_frame()
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                if not ok:
+                    time.sleep(0.05)
+                    continue
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                       + buf.tobytes() + b"\r\n")
+            except Exception as exc:
+                log.warning("stream: frame error: %s", exc)
                 time.sleep(0.05)
                 continue
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-                   + buf.tobytes() + b"\r\n")
             time.sleep(0.04)
     return StreamingResponse(generate(),
                              media_type="multipart/x-mixed-replace; boundary=frame")
@@ -1517,6 +2390,21 @@ async def stream():
 @app.get("/api/nxt-status")
 async def api_nxt_status():
     return {"connected": _nxt_connected()}
+
+
+@app.get("/api/nxt-battery")
+async def api_nxt_battery():
+    if _navigator is None:
+        return {"ok": False, "reason": "navigator not running"}
+    drive = getattr(_navigator, "_drive", None)
+    brick = getattr(drive, "_brick", None)
+    if brick is None:
+        return {"ok": False, "reason": "NXT not connected"}
+    try:
+        mv = brick.get_battery_level()
+        return {"ok": True, "mv": mv, "v": round(mv / 1000, 2)}
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc)}
 
 
 @app.get("/api/status")
@@ -1532,7 +2420,10 @@ async def api_status():
         "nxt_connected":   _nxt_connected(),
         "package_qr":      _mission.package_qr if _mission else None,
         "destination":     _mission.destination if _mission else None,
+        "bot_aruco_id":    _registry.get_bot_aruco_id() if _registry else None,
+        "claw_center_offset_px": _registry.get_claw_center_offset_px() if _registry else None,
         "stations":        _registry.all() if _registry else {},
+        "station_drop_offsets": _registry.all_station_drop_offsets() if _registry else {},
         "full_station_qrs": list(s.full_station_qrs) if s else [],
     }
 
@@ -1584,6 +2475,7 @@ async def api_setup_assign(body: dict):
         if station == "base":
             _apply_base_parking()
         if station in ("station_1", "station_2", "station_3"):
+            _registry.clear_station_drop_offset(station)
             _apply_station_qrs()
         asyncio.create_task(_broadcast_state())
         return {"ok": True}
@@ -1598,6 +2490,7 @@ async def api_setup_clear(body: dict):
         return {"ok": False, "reason": "unknown station"}
     _registry.clear(station)
     if station in ("station_1", "station_2", "station_3"):
+        _registry.clear_station_drop_offset(station)
         _apply_station_qrs()
     asyncio.create_task(_broadcast_state())
     return {"ok": True}
@@ -1609,8 +2502,8 @@ async def api_mission_start(body: dict):
     package_qr = body.get("package_qr", "").strip()
     if not package_qr:
         return {"ok": False, "reason": "package_qr required"}
-    if not _registry.is_complete():
-        return {"ok": False, "reason": "not all stations registered"}
+    if not _registry.get("base"):
+        return {"ok": False, "reason": "base QR not registered"}
     ok = _mission.start(package_qr)
     if ok:
         asyncio.create_task(_broadcast_state())
@@ -1674,6 +2567,25 @@ def _generate_base_qr() -> str:
     return path
 
 
+def _generate_aruco_png(marker_id: int, size_px: int = 400) -> str:
+    """Generate an ArUco marker PNG and return its file path."""
+    aruco = getattr(cv2, "aruco", None)
+    if aruco is None:
+        raise RuntimeError("OpenCV ArUco module is not available in this build")
+    if not (0 <= int(marker_id) <= 49):
+        raise ValueError("marker_id must be between 0 and 49 for DICT_4X4_50")
+    os.makedirs(QR_CODES_DIR, exist_ok=True)
+    dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+    if hasattr(aruco, "generateImageMarker"):
+        img = aruco.generateImageMarker(dictionary, int(marker_id), int(size_px))
+    else:
+        img = np.zeros((int(size_px), int(size_px)), dtype=np.uint8)
+        aruco.drawMarker(dictionary, int(marker_id), int(size_px), img, 1)
+    path = os.path.join(QR_CODES_DIR, f"aruco_4x4_50_{int(marker_id)}.png")
+    cv2.imwrite(path, img)
+    return path
+
+
 # ── setup extras: snapshot + bot-direction ────────────────────────────────────
 
 @app.get("/api/setup/snapshot")
@@ -1716,6 +2628,141 @@ async def api_bot_qr_info():
         "qr_angle":  _qr_heading(c, 0.0),
         "current_offset": _registry.get_heading_offset() if _registry else 0.0,
     }
+
+
+@app.get("/api/setup/aruco-info")
+async def api_aruco_info():
+    configured_id = _registry.get_bot_aruco_id() if _registry else None
+    if _navigator is None:
+        return {"found": False, "reason": "navigator not running", "configured_id": configured_id, "visible_ids": []}
+    with _navigator._frame_lock:
+        frame = _navigator._raw_frame.copy() if _navigator._raw_frame is not None else None
+    if frame is None:
+        return {"found": False, "reason": "no camera frame yet", "configured_id": configured_id, "visible_ids": []}
+    items = _detect_aruco(frame)
+    visible_ids = sorted(i["id"] for i in items)
+    marker = next((i for i in items if i["id"] == configured_id), None) if configured_id is not None else None
+    if marker is None:
+        return {
+            "found": False,
+            "reason": "configured ArUco marker not visible" if configured_id is not None else "no ArUco marker configured",
+            "configured_id": configured_id,
+            "visible_ids": visible_ids,
+        }
+    c = marker["corners"]
+    return {
+        "found": True,
+        "configured_id": configured_id,
+        "visible_ids": visible_ids,
+        "cx": marker["cx"],
+        "cy": marker["cy"],
+        "x": int(c[:, 0].min()),
+        "y": int(c[:, 1].min()),
+        "w": int(c[:, 0].max() - c[:, 0].min()),
+        "h": int(c[:, 1].max() - c[:, 1].min()),
+    }
+
+
+@app.post("/api/setup/aruco-config")
+async def api_aruco_config(body: dict):
+    marker_id = body.get("id")
+    if marker_id is None:
+        return {"ok": False, "reason": "id required"}
+    marker_id = int(marker_id)
+    if not (0 <= marker_id <= 49):
+        return {"ok": False, "reason": "id must be between 0 and 49"}
+    _registry.set_bot_aruco_id(marker_id)
+    _apply_bot_qr()
+    asyncio.create_task(_broadcast_state())
+    return {"ok": True, "id": marker_id}
+
+
+@app.post("/api/setup/aruco-clear")
+async def api_aruco_clear():
+    _registry.clear_bot_aruco_id()
+    _apply_bot_qr()
+    asyncio.create_task(_broadcast_state())
+    return {"ok": True}
+
+
+def _get_claw_center_info_from_frame(frame: np.ndarray) -> dict:
+    bot_qr = _registry.get("bot") if _registry else None
+    configured_id = _registry.get_bot_aruco_id() if _registry else None
+    saved_offset = _registry.get_claw_center_offset_px() if _registry else None
+    if not bot_qr:
+        return {"found": False, "reason": "bot QR not registered yet", "offset_px": saved_offset}
+    if configured_id is None:
+        return {"found": False, "reason": "no ArUco marker configured for the bot front", "offset_px": saved_offset}
+
+    items = _detect_overhead(frame)
+    aruco_items = _detect_aruco(frame)
+    bot = next((i for i in items if i["payload"] == bot_qr), None)
+    if bot is None:
+        return {"found": False, "reason": "bot QR not visible in frame", "offset_px": saved_offset}
+    marker = next((i for i in aruco_items if i["id"] == configured_id), None)
+    if marker is None:
+        return {"found": False, "reason": "configured front ArUco not visible", "offset_px": saved_offset}
+
+    vx = float(marker["cx"] - bot["cx"])
+    vy = float(marker["cy"] - bot["cy"])
+    norm = math.hypot(vx, vy)
+    if norm < 1e-6:
+        return {"found": False, "reason": "bot QR centre and ArUco centre overlap", "offset_px": saved_offset}
+
+    c = bot["corners"]
+    return {
+        "found": True,
+        "bot_cx": float(bot["cx"]),
+        "bot_cy": float(bot["cy"]),
+        "bot_x": int(c[:, 0].min()),
+        "bot_y": int(c[:, 1].min()),
+        "bot_w": int(c[:, 0].max() - c[:, 0].min()),
+        "bot_h": int(c[:, 1].max() - c[:, 1].min()),
+        "aruco_cx": float(marker["cx"]),
+        "aruco_cy": float(marker["cy"]),
+        "axis_dx": vx / norm,
+        "axis_dy": vy / norm,
+        "offset_px": saved_offset,
+        "configured_id": configured_id,
+    }
+
+
+@app.get("/api/setup/claw-center-info")
+async def api_claw_center_info():
+    if _navigator is None:
+        return {"found": False, "reason": "navigator not running", "offset_px": _registry.get_claw_center_offset_px() if _registry else None}
+    with _navigator._frame_lock:
+        frame = _navigator._raw_frame.copy() if _navigator._raw_frame is not None else None
+    if frame is None:
+        return {"found": False, "reason": "no camera frame yet", "offset_px": _registry.get_claw_center_offset_px() if _registry else None}
+    return _get_claw_center_info_from_frame(frame)
+
+
+@app.post("/api/setup/claw-center")
+async def api_claw_center_set(body: dict):
+    offset_px = body.get("offset_px")
+    if offset_px is None:
+        return {"ok": False, "reason": "offset_px required"}
+    if not _registry.get("bot"):
+        return {"ok": False, "reason": "bot QR not registered"}
+    if _registry.get_bot_aruco_id() is None:
+        return {"ok": False, "reason": "configure the bot ArUco first"}
+    try:
+        offset_px = float(offset_px)
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "offset_px must be numeric"}
+    _registry.set_claw_center_offset_px(offset_px)
+    _apply_bot_qr()
+    asyncio.create_task(_broadcast_state())
+    return {"ok": True, "offset_px": round(offset_px, 1)}
+
+
+@app.post("/api/setup/claw-center/clear")
+async def api_claw_center_clear():
+    _registry.clear_claw_center_offset_px()
+    _apply_bot_qr()
+    asyncio.create_task(_broadcast_state())
+    return {"ok": True}
 
 
 @app.post("/api/setup/bot-direction")
@@ -1810,6 +2857,21 @@ async def api_generate_base():
         return {"ok": False, "reason": str(e)}
 
 
+@app.post("/api/setup/generate-aruco")
+async def api_generate_aruco(body: dict):
+    """Generate an ArUco PNG in qr_codes/ for the requested marker ID."""
+    try:
+        marker_id = int(body.get("id"))
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "id required"}
+    size_px = int(body.get("size_px", 400))
+    try:
+        path = _generate_aruco_png(marker_id, size_px=size_px)
+        return {"ok": True, "id": marker_id, "path": path}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+
 # ── base parking routes ───────────────────────────────────────────────────────
 
 @app.get("/api/setup/base-parking-info")
@@ -1866,36 +2928,64 @@ async def api_base_parking_clear():
     return {"ok": True}
 
 
-# ── background subtraction routes ────────────────────────────────────────────
-
-@app.post("/api/setup/set-background")
-async def api_set_background():
-    """Capture current frame as the clean background reference."""
+@app.get("/api/setup/station-drop-info")
+async def api_station_drop_info(station: str):
+    """Station QR position in current frame + saved claw-centre drop target offset."""
+    if station not in ("station_1", "station_2", "station_3"):
+        return {"found": False, "reason": "unknown station"}
+    station_qr = _registry.get(station) if _registry else None
+    if not station_qr:
+        return {"found": False, "reason": f"{station} QR not registered"}
     if _navigator is None:
-        return {"ok": False, "reason": "navigator not running"}
+        return {"found": False, "reason": "navigator not running"}
     with _navigator._frame_lock:
         frame = _navigator._raw_frame.copy() if _navigator._raw_frame is not None else None
     if frame is None:
-        return {"ok": False, "reason": "no camera frame yet"}
-    cv2.imwrite(BG_FRAME_PATH, frame)
-    _navigator.set_background(frame)
-    log.info("Background reference captured and saved to %s", BG_FRAME_PATH)
+        return {"found": False, "reason": "no camera frame yet"}
+    items = _detect_overhead(frame)
+    station_item = next((i for i in items if i["payload"] == station_qr), None)
+    offset = _registry.get_station_drop_offset(station) if _registry else None
+    if not station_item:
+        return {
+            "found": False,
+            "reason": "station QR not visible in frame",
+            "offset": {"dx": offset[0], "dy": offset[1]} if offset else None,
+        }
+    c = station_item["corners"]
+    return {
+        "found": True,
+        "cx": station_item["cx"],
+        "cy": station_item["cy"],
+        "x": int(c[:, 0].min()),
+        "y": int(c[:, 1].min()),
+        "w": int(c[:, 0].max() - c[:, 0].min()),
+        "h": int(c[:, 1].max() - c[:, 1].min()),
+        "offset": {"dx": offset[0], "dy": offset[1]} if offset else None,
+    }
+
+
+@app.post("/api/setup/station-drop")
+async def api_station_drop_set(body: dict):
+    station = body.get("station", "")
+    dx = body.get("dx")
+    dy = body.get("dy")
+    if station not in ("station_1", "station_2", "station_3"):
+        return {"ok": False, "reason": "unknown station"}
+    if dx is None or dy is None:
+        return {"ok": False, "reason": "dx and dy required"}
+    _registry.set_station_drop_offset(station, float(dx), float(dy))
+    asyncio.create_task(_broadcast_state())
     return {"ok": True}
 
 
-@app.post("/api/setup/clear-background")
-async def api_clear_background():
-    """Delete stored background reference (disables obstacle detection)."""
-    if os.path.exists(BG_FRAME_PATH):
-        os.remove(BG_FRAME_PATH)
-    if _navigator:
-        _navigator.set_background(None)
+@app.post("/api/setup/station-drop/clear")
+async def api_station_drop_clear(body: dict):
+    station = body.get("station", "")
+    if station not in ("station_1", "station_2", "station_3"):
+        return {"ok": False, "reason": "unknown station"}
+    _registry.clear_station_drop_offset(station)
+    asyncio.create_task(_broadcast_state())
     return {"ok": True}
-
-
-@app.get("/api/setup/bg-status")
-async def api_bg_status():
-    return {"set": os.path.exists(BG_FRAME_PATH)}
 
 
 # ── test routes ──────────────────────────────────────────────────────────────
@@ -1911,8 +3001,9 @@ async def api_test_goto(body: dict):
         return {"ok": False, "reason": f"station '{station}' not registered"}
     _test_target = station
     _navigator.set_target(qr)
+    _navigator.set_motion_policy(allow_reverse=(station == "base"), force_reverse=False)
     _navigator.set_navigating(True)
-    log.info("Test: navigating to %s (QR=%s)", station, qr)
+    log.info("Test: navigating to %s (QR=%s, allow_reverse=%s)", station, qr, station == "base")
     asyncio.create_task(_broadcast_state())
     return {"ok": True}
 
@@ -1929,6 +3020,7 @@ async def api_test_goto_qr(body: dict):
         return {"ok": False, "reason": "navigator not running"}
     _test_target = qr
     _navigator.set_target(qr)
+    _navigator.set_motion_policy(allow_reverse=False, force_reverse=False)
     _navigator.set_navigating(True)
     log.info("Test: navigating to QR=%s", qr)
     asyncio.create_task(_broadcast_state())
@@ -1941,7 +3033,28 @@ async def api_test_stop():
     _test_target = None
     if _navigator:
         _navigator.set_navigating(False)
+        _navigator.set_motion_policy(allow_reverse=True, force_reverse=False)
     asyncio.create_task(_broadcast_state())
+    return {"ok": True}
+
+
+# ── manual drive routes ───────────────────────────────────────────────────────
+
+@app.post("/api/manual/drive")
+async def api_manual_drive(body: dict):
+    if _navigator is None:
+        return {"ok": False, "reason": "navigator not running"}
+    left  = max(-100, min(100, int(body.get("left",  0))))
+    right = max(-100, min(100, int(body.get("right", 0))))
+    _navigator.set_manual_drive(left, right)
+    return {"ok": True, "left": left, "right": right}
+
+
+@app.post("/api/manual/stop")
+async def api_manual_stop():
+    if _navigator is None:
+        return {"ok": False, "reason": "navigator not running"}
+    _navigator.clear_manual_drive()
     return {"ok": True}
 
 
@@ -1956,19 +3069,31 @@ async def api_camera_list():
         except ValueError:
             continue
         label = path
+        is_capture = False
         try:
-            result = subprocess.run(
+            info_result = subprocess.run(
                 ["v4l2-ctl", f"--device={path}", "--info"],
                 capture_output=True, text=True, timeout=2,
             )
-            for line in result.stdout.splitlines():
+            for line in info_result.stdout.splitlines():
                 if "Card type" in line:
                     label = line.split(":", 1)[1].strip()
                     break
+            # Only include nodes that actually have capture formats (not metadata nodes)
+            fmt_result = subprocess.run(
+                ["v4l2-ctl", f"--device={path}", "--list-formats"],
+                capture_output=True, text=True, timeout=2,
+            )
+            is_capture = any(line.strip().startswith("[") for line in fmt_result.stdout.splitlines())
         except Exception:
             pass
+        if not is_capture:
+            log.debug("camera/list: skipping %s (no capture formats)", path)
+            continue
         devices.append({"index": idx, "path": path, "label": label})
     current = getattr(_app_config, "camera_index", 0) if _app_config else 0
+    log.info("camera/list: found capture devices %s (current=%d)",
+             [d["index"] for d in devices], current)
     return {"devices": devices, "current": current}
 
 
@@ -1982,16 +3107,23 @@ async def api_camera_switch(body: dict):
     if idx is None:
         return {"ok": False, "reason": "index required"}
     idx = int(idx)
+    log.info("Camera switch requested: → index %d", idx)
     if _navigator:
-        _navigator.stop()
-    if _nav_thread:
-        _nav_thread.join(timeout=3.0)
+        old_nav = _navigator
+        _navigator = None   # stream serves placeholder immediately while we wait
+        old_nav.stop()
+        stopped_ok = old_nav.wait_stopped(timeout=6.0)
+        log.info("Camera switch: old navigator stopped cleanly=%s", stopped_ok)
+        if not stopped_ok:
+            log.warning("Camera switch: old navigator did not stop within 6s — proceeding anyway")
+        time.sleep(0.3)  # give V4L2 driver time to release the device
+    log.info("Camera switch: opening new navigator on camera %d", idx)
     _app_config.camera_index = idx
     _navigator = build_navigator(_app_config, on_state_change=_on_state_change)
     _apply_bot_qr()
     _apply_base_parking()
     _apply_station_qrs()
-    _load_background()
+
     if _mission:
         _mission._nav = _navigator
     _nav_thread = threading.Thread(target=_navigator.run, daemon=True, name="navigator")
@@ -2025,17 +3157,24 @@ _app_config = None
 
 
 def _apply_bot_qr() -> None:
-    """Push current bot QR, heading offset, and claw offset from registry into the navigator."""
+    """Push current bot QR, ArUco heading marker, offsets, and claw geometry into the navigator."""
     if _navigator and _registry:
-        bot_qr        = _registry.get("bot")
-        offset        = _registry.get_heading_offset()
-        claw_offset   = _registry.get_claw_offset_px()
+        bot_qr            = _registry.get("bot")
+        bot_aruco_id      = _registry.get_bot_aruco_id()
+        offset            = _registry.get_heading_offset()
+        claw_offset       = _registry.get_claw_offset_px()
+        claw_center_offset = _registry.get_claw_center_offset_px()
         _navigator.set_bot_qr(bot_qr)
-        _navigator._heading_offset = offset
+        _navigator.set_bot_aruco_id(bot_aruco_id)
+        _navigator.set_claw_center_offset_px(claw_center_offset)
+        _navigator._heading_offset  = offset
+        _navigator._smoothed_heading = None  # force re-init with new offset
         if claw_offset > 0:
             _navigator._claw_offset_px = claw_offset
-        log.info("Navigator bot_qr=%s heading_offset=%.1f° claw_offset=%dpx",
-                 bot_qr or "None", math.degrees(offset), _navigator._claw_offset_px)
+        log.info("Navigator bot_qr=%s bot_aruco_id=%s heading_offset=%.1f° claw_offset=%dpx claw_center=%s",
+                 bot_qr or "None", str(bot_aruco_id) if bot_aruco_id is not None else "None",
+                 math.degrees(offset), _navigator._claw_offset_px,
+                 f"{claw_center_offset:.1f}px" if claw_center_offset is not None else "None")
 
 
 def _apply_base_parking() -> None:
@@ -2057,22 +3196,16 @@ def _apply_station_qrs() -> None:
         log.info("Navigator station_qrs=%s", qrs)
 
 
-def _load_background() -> None:
-    """Reload saved background reference frame into the navigator (persists across restarts)."""
-    if _navigator is None:
-        return
-    if os.path.exists(BG_FRAME_PATH):
-        frame = cv2.imread(BG_FRAME_PATH)
-        if frame is not None:
-            _navigator.set_background(frame)
-            log.info("Background reference loaded from %s", BG_FRAME_PATH)
-            return
-    _navigator.set_background(None)
-
 
 @app.on_event("startup")
 async def _startup():
-    global _loop, _navigator, _nav_thread, _mission, _registry
+    global _loop, _navigator, _nav_thread, _mission, _registry, _app_config
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    if _app_config is None:
+        _app_config = load_config()
     _loop     = asyncio.get_event_loop()
     _registry = StationsRegistry()
 
@@ -2080,7 +3213,7 @@ async def _startup():
     _apply_bot_qr()
     _apply_base_parking()
     _apply_station_qrs()
-    _load_background()
+
 
     _mission   = MissionController(_navigator, _registry)
     _mission.set_on_change(

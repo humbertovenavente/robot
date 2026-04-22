@@ -18,15 +18,19 @@ from navigator import DriveInterface, DEFAULT_DRIVE_SPEED
 log = logging.getLogger(__name__)
 
 # Minimum ms between USB motor commands — NXT disconnects if flooded
-_CMD_THROTTLE_MS = 180
+_CMD_THROTTLE_MS = 100
 # How often to send keep_alive to prevent NXT auto-sleep (seconds)
 _KEEPALIVE_INTERVAL_S = 8
+# Minimum absolute power for any nonzero reverse command — overcomes static friction
+_REVERSE_MIN_POWER = 75
 
 # Claw (Motor B) — flip signs if your claw moves the wrong way
 _CLAW_PORT        = "B"
 _CLAW_OPEN_POWER  =  70   # positive = open
-_CLAW_CLOSE_POWER = -70   # negative = close
-_CLAW_DURATION_S  =  0.6  # seconds to run motor before braking
+_CLAW_CLOSE_POWER = -90   # negative = close; stronger grip to avoid drops while backing
+_CLAW_OPEN_DURATION_S  = 0.6
+_CLAW_CLOSE_DURATION_S = 0.9
+_CLAW_HOLD_POWER  = -65   # keep closing torque applied while carrying
 
 
 class NXTDrive(DriveInterface):
@@ -48,6 +52,7 @@ class NXTDrive(DriveInterface):
         self._last_cmd_t  = 0.0               # timestamp of last command sent
         self._last_pl     = None              # last left power sent
         self._last_pr     = None              # last right power sent
+        self._claw_holding = False
         self._ka_thread: threading.Thread | None = None
         self._ka_stop     = threading.Event()
         self._connect()
@@ -129,11 +134,19 @@ class NXTDrive(DriveInterface):
     # ── DriveInterface ──────────────────────────────────────────────────────────
     def _send(self, pl: int, pr: int, label: str) -> None:
         """Send L/R power to motors with throttle + lock to avoid NXT USB overflow."""
+        # Enforce minimum reverse power so the motor doesn't stall on static friction
+        if pl < 0 and abs(pl) < _REVERSE_MIN_POWER:
+            pl = -_REVERSE_MIN_POWER
+        if pr < 0 and abs(pr) < _REVERSE_MIN_POWER:
+            pr = -_REVERSE_MIN_POWER
         now = time.monotonic() * 1000
-        if pl == self._last_pl and pr == self._last_pr:
-            if now - self._last_cmd_t < _CMD_THROTTLE_MS:
-                return
-        if now - self._last_cmd_t < _CMD_THROTTLE_MS / 2:
+        elapsed = now - self._last_cmd_t
+        # Skip if same command sent recently
+        if pl == self._last_pl and pr == self._last_pr and elapsed < _CMD_THROTTLE_MS:
+            return
+        # Skip if any command was sent too recently — UNLESS we're transitioning from stop to drive
+        transitioning = (self._last_pl == 0 and self._last_pr == 0) and (pl != 0 or pr != 0)
+        if not transitioning and elapsed < _CMD_THROTTLE_MS / 2:
             return
         with self._lock:
             try:
@@ -161,9 +174,6 @@ class NXTDrive(DriveInterface):
     def stop_motors(self) -> None:
         if not self._ensure_connected():
             return
-        now = time.monotonic() * 1000
-        if now - self._last_cmd_t < _CMD_THROTTLE_MS / 2:
-            return
         with self._lock:
             try:
                 self._set_output(self._left_port_name,  0, brake=True)
@@ -181,12 +191,12 @@ class NXTDrive(DriveInterface):
 
     def open_claw(self) -> None:
         """Run Motor B to open claw. Flip _CLAW_OPEN_POWER sign if direction is wrong."""
-        self._run_claw(_CLAW_OPEN_POWER, "open")
+        self._run_claw(_CLAW_OPEN_POWER, "open", _CLAW_OPEN_DURATION_S, hold_power=None)
 
     def close_claw(self) -> None:
-        self._run_claw(_CLAW_CLOSE_POWER, "close")
+        self._run_claw(_CLAW_CLOSE_POWER, "close", _CLAW_CLOSE_DURATION_S, hold_power=_CLAW_HOLD_POWER)
 
-    def _run_claw(self, power: int, label: str) -> None:
+    def _run_claw(self, power: int, label: str, duration_s: float, hold_power: int | None) -> None:
         if not self._ensure_connected():
             log.warning("NXTDrive: brick not connected — skipping claw %s", label)
             return
@@ -196,11 +206,17 @@ class NXTDrive(DriveInterface):
             except Exception as exc:
                 log.error("NXTDrive claw %s start: %s", label, exc)
                 return
-        time.sleep(_CLAW_DURATION_S)
+        time.sleep(duration_s)
         with self._lock:
             try:
-                self._set_output(_CLAW_PORT, 0, brake=True)
-                log.info("NXTDrive: claw %s done", label)
+                if hold_power is None:
+                    self._set_output(_CLAW_PORT, 0, brake=True)
+                    self._claw_holding = False
+                    log.info("NXTDrive: claw %s done", label)
+                else:
+                    self._set_output(_CLAW_PORT, hold_power, brake=False)
+                    self._claw_holding = True
+                    log.info("NXTDrive: claw %s done, holding at %d", label, hold_power)
             except Exception as exc:
                 log.error("NXTDrive claw %s stop: %s", label, exc)
 

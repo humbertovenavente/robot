@@ -1,5 +1,5 @@
 station_id: station-1
-camera_index: 1
+camera_index: 0
 yolo_model_path: models/best.pt
 yolo_confidence_threshold: 0.40
 yolo_imgsz: 640
@@ -34,14 +34,15 @@ qr_approach_encoder_target: null
 nav_robot: nxt
 nav_arrived_area_pct: 0.15   # QR ocupa 15% del frame → llegó
 nav_center_tol_px: 60        # px tolerancia al centro antes de girar
-nav_drive_speed: 95          # velocidad adelante 0-100
-nav_turn_speed: 85           # velocidad de giro 0-100
+nav_drive_speed: 75          # velocidad adelante 0-100
+nav_turn_speed: 70           # velocidad de giro 0-100
 nav_motor_left_port: A       # puerto motor izquierdo (A/B/C)
 nav_motor_right_port: C      # puerto motor derecho  (A/B/C)
 nav_invert_left: false       # true si la rueda izquierda gira al revés
 nav_invert_right: false      # true si la rueda derecha gira al revés
 nav_claw_offset_px: 120      # px ≡ 11cm claw reach — tune to match camera scale
                              # measure: how many pixels is 11cm at your camera height?
+nav_claw_arrived_bias_px: -20 # negative = stop closer than calibrated claw reach (tune if claw misses)
 
 # Obstacle detection — OBS-01 (set obstacle_detection_enabled: true to activate)
 # Uses yolov8n.pt (COCO, already in repo root) to detect objects in the robot's path.

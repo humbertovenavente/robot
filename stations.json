@@ -1,7 +1,15 @@
 {
-  "station_1": "A",
+  "bot_heading_offset": -3.101286557872281,
+  "base": "ROBOT",
+  "bot": "C",
   "station_2": "B",
-  "station_3": "C",
-  "bot": "Robot",
-  "bot_heading_offset": -1.5247201769304266
+  "base_parking_offset": {
+    "dx": -115.5,
+    "dy": -27.0
+  },
+  "claw_offset_px": 97,
+  "bot_aruco_id": 0,
+  "station_3": "pkg1",
+  "station_1": "A",
+  "claw_center_offset_px": 86.8
 }
