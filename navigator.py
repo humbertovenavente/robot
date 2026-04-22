@@ -33,6 +33,8 @@ DEFAULT_ARRIVED_DIST_PX  = 80     # overhead mode: pixels bot→target = arrived
 DEFAULT_BASE_PARK_ARRIVED_DIST_PX = 28  # tighter stop when parking bot QR onto saved base slot
 DEFAULT_CLAW_CENTER_CM = 10.0     # fallback guess when claw centre has not been image-calibrated
 DEFAULT_CLAW_CENTER_ARRIVED_DIST_PX = 18  # calibrated claw centre may come this close to target before stopping
+DEFAULT_PICKUP_CONTACT_MIN_PX = 24
+DEFAULT_PICKUP_CONTACT_RATIO = 0.35
 
 _REPULSE_RADIUS_PX   = 150   # px from obstacle centre where repulsion starts
 _OCCLUDE_FULL_FRAMES  = 45   # consecutive missing frames → station "full"  (~1.8 s at 25 fps)
@@ -459,6 +461,7 @@ class QRNavigator:
         self._claw_center_offset_px = claw_center_offset_px
         self._use_claw_arrived = False             # toggled by mission controller
         self._claw_arrived_adjust_px = 0          # signed pixel adjustment for claw-mode arrival
+        self._pickup_contact_arrived = False
         self._allow_reverse = True
         self._force_reverse = False
         self._center_tol_px    = center_tol_px
@@ -560,6 +563,10 @@ class QRNavigator:
         """When True, arrived uses claw_offset_px plus an optional signed pixel adjustment."""
         self._use_claw_arrived = active
         self._claw_arrived_adjust_px = int(adjust_px) if active else 0
+
+    def set_pickup_contact_arrived(self, active: bool) -> None:
+        """When True, package pickup can stop on claw contact before QR occlusion."""
+        self._pickup_contact_arrived = bool(active)
 
     def set_motion_policy(self, *, allow_reverse: bool = True, force_reverse: bool = False) -> None:
         """Control whether nav may reverse, or must reverse for the current target."""
@@ -935,6 +942,7 @@ class QRNavigator:
         dx, dy   = eff_tx - bx, eff_ty - by
         distance = math.hypot(dx, dy)
         claw_distance = math.hypot(eff_tx - claw_x, eff_ty - claw_y)
+        target_size_px = _marker_size_px(target["corners"])
 
         if self._use_claw_arrived and has_calibrated_claw_center:
             arrived_threshold = max(8, DEFAULT_CLAW_CENTER_ARRIVED_DIST_PX + self._claw_arrived_adjust_px)
@@ -948,7 +956,13 @@ class QRNavigator:
         self._last_target_pos = (eff_tx, eff_ty)
         self._last_target_metric = distance_metric
         self._last_target_seen_t = time.time()
-        if distance_metric < arrived_threshold:
+        pickup_contact = (
+            self._pickup_contact_arrived
+            and self._use_claw_arrived
+            and not is_base_parking
+            and claw_distance <= max(DEFAULT_PICKUP_CONTACT_MIN_PX, target_size_px * DEFAULT_PICKUP_CONTACT_RATIO)
+        )
+        if pickup_contact or distance_metric < arrived_threshold:
             self._drive.stop_motors()
             self._set_state(
                 status="arrived",
@@ -959,12 +973,17 @@ class QRNavigator:
                 target_pos=(eff_tx, eff_ty), dist_to_target=distance_metric, heading_error=0.0,
                 parking_target_pos=park_pos, full_station_qrs=full_list,
             )
-            log.info("Navigator (overhead): arrived at '%s' dist=%.1fpx",
-                     self._target_qr, distance_metric)
+            if pickup_contact:
+                log.info("Navigator (overhead): pickup contact at '%s' claw_dist=%.1fpx qr_size=%.1fpx",
+                         self._target_qr, claw_distance, target_size_px)
+            else:
+                log.info("Navigator (overhead): arrived at '%s' dist=%.1fpx",
+                         self._target_qr, distance_metric)
             return
 
+        front_only_target = (not self._allow_reverse) and (not is_base_parking)
         align_x, align_y = bx, by
-        if (not self._allow_reverse) and (not is_base_parking) and bot_aruco is not None:
+        if front_only_target and bot_aruco is not None:
             # For station/package runs, align the front axis defined by QR -> ArUco.
             align_x, align_y = bot_aruco["cx"], bot_aruco["cy"]
         desired = _avoidance_heading(align_x, align_y, eff_tx, eff_ty, qr_items,
@@ -975,7 +994,7 @@ class QRNavigator:
         forward_proj = math.cos(bot_hdg) * rel_dx + math.sin(bot_hdg) * rel_dy
         side_err = math.cos(bot_hdg) * rel_dy - math.sin(bot_hdg) * rel_dx
         forward_turn_err = err
-        if (not self._allow_reverse) and abs(side_err) > 1e-6:
+        if front_only_target and abs(side_err) > 1e-6:
             # For forward-only delivery runs, choose left/right from the visible side
             # of the target relative to the bot. This is more stable than relying on
             # the wrapped sign of ±pi when the target is nearly behind.
@@ -1050,16 +1069,23 @@ class QRNavigator:
         self._in_reverse_steer  = False
         self._reverse_steer_dir = None
 
+        force_front_turn = front_only_target and (forward_proj <= 0.0)
+        turn_enter_threshold = self._align_threshold
+        if front_only_target:
+            # Delivery targets should be brought much closer to the claw-facing axis
+            # before we allow any forward motion.
+            turn_enter_threshold = min(self._align_threshold, math.radians(25))
+
         # Hysteresis: enter in-place turn at align_threshold, exit only at 70% of it
-        _exit_threshold = self._align_threshold * 0.7
-        entering_turn = abs(err) > self._align_threshold
-        staying_in_turn = self._in_place_turning and abs(err) > _exit_threshold
+        _exit_threshold = turn_enter_threshold * 0.7
+        entering_turn = abs(err) > turn_enter_threshold or force_front_turn
+        staying_in_turn = self._in_place_turning and (abs(err) > _exit_threshold or force_front_turn)
 
         if entering_turn or staying_in_turn:
             if not self._in_place_turning:
                 # Commit to a direction on entry — prevents ±π sign-flip oscillation
                 self._committed_turn_dir = 1.0 if forward_turn_err > 0 else -1.0
-            elif not self._allow_reverse:
+            elif front_only_target:
                 # Forward-only runs must keep rotating the front axis toward the target.
                 # Do not reconsider the opposite turn while the target is still behind
                 # the ArUco-facing hemisphere.
@@ -1080,8 +1106,12 @@ class QRNavigator:
             self._in_place_turning   = False
             self._committed_turn_dir = None
             turn        = int((forward_turn_err / self._align_threshold) * self._turn_speed)
-            left_speed  = max(-100, min(100, self._drive_speed + turn))
-            right_speed = max(-100, min(100, self._drive_speed - turn))
+            if front_only_target:
+                left_speed  = max(0, min(100, self._drive_speed + turn))
+                right_speed = max(0, min(100, self._drive_speed - turn))
+            else:
+                left_speed  = max(-100, min(100, self._drive_speed + turn))
+                right_speed = max(-100, min(100, self._drive_speed - turn))
             self._drive.drive(left_speed, right_speed)
             new_status  = "approaching" if abs(err) < 0.15 else "centering"
 

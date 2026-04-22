@@ -250,16 +250,18 @@ class MissionController:
     def _navigate_to(self, qr_code: str, label: str, timeout: float = 120.0,
                      claw_mode: bool = False, claw_adjust_px: int = 0,
                      allow_reverse: bool = True, force_reverse: bool = False,
-                     target_offset: Optional[tuple] = None) -> bool:
+                     target_offset: Optional[tuple] = None,
+                     pickup_contact: bool = False) -> bool:
         self._arrived.clear()
         self._nav.set_target(qr_code)
         self._nav.set_target_offset(target_offset)
         self._nav.set_motion_policy(allow_reverse=allow_reverse, force_reverse=force_reverse)
         if claw_mode:
             self._nav.set_claw_arrived(True, adjust_px=claw_adjust_px)
+        self._nav.set_pickup_contact_arrived(pickup_contact)
         self._nav.set_navigating(True)
-        log.info("Mission: navigating to %s (QR=%s, claw_mode=%s, claw_adjust_px=%d, allow_reverse=%s, force_reverse=%s, target_offset=%s)",
-                 label, qr_code, claw_mode, claw_adjust_px, allow_reverse, force_reverse, target_offset)
+        log.info("Mission: navigating to %s (QR=%s, claw_mode=%s, claw_adjust_px=%d, allow_reverse=%s, force_reverse=%s, target_offset=%s, pickup_contact=%s)",
+                 label, qr_code, claw_mode, claw_adjust_px, allow_reverse, force_reverse, target_offset, pickup_contact)
         deadline = time.monotonic() + timeout
         ok = False
         while time.monotonic() < deadline:
@@ -271,6 +273,7 @@ class MissionController:
         self._nav.set_navigating(False)
         self._nav.set_target_offset(None)
         self._nav.set_motion_policy(allow_reverse=True, force_reverse=False)
+        self._nav.set_pickup_contact_arrived(False)
         if claw_mode:
             self._nav.set_claw_arrived(False)
         if self._aborted():
@@ -388,7 +391,7 @@ class MissionController:
             self._set_state("going_to_package")
             self._depart_base_forward()
             if not self._navigate_to(
-                self.package_qr, "package", claw_mode=True, allow_reverse=False
+                self.package_qr, "package", claw_mode=True, allow_reverse=False, pickup_contact=True
             ):
                 self._reset_context()
                 self._set_state("idle")
