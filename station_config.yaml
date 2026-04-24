@@ -34,7 +34,7 @@ qr_approach_encoder_target: null
 nav_robot: nxt
 nav_arrived_area_pct: 0.15   # QR ocupa 15% del frame → llegó
 nav_center_tol_px: 60        # px tolerancia al centro antes de girar
-nav_drive_speed: 75          # velocidad adelante 0-100
+nav_drive_speed: 62          # velocidad adelante 0-100
 nav_turn_speed: 70           # velocidad de giro 0-100
 nav_motor_left_port: A       # puerto motor izquierdo (A/B/C)
 nav_motor_right_port: C      # puerto motor derecho  (A/B/C)

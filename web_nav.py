@@ -194,6 +194,26 @@ class StationsRegistry:
         self._data.pop("bot_aruco_id", None)
         self.save()
 
+    # ── package queue ──────────────────────────────────────────────────────────
+    def register_package(self, qr: str, station_key: str) -> None:
+        pkgs = self._data.setdefault("packages", {})
+        pkgs[qr] = station_key
+        self.save()
+
+    def unregister_package(self, qr: str) -> None:
+        self._data.get("packages", {}).pop(qr, None)
+        self.save()
+
+    def get_package_station(self, qr: str) -> Optional[str]:
+        return self._data.get("packages", {}).get(qr)
+
+    def all_packages(self) -> dict:
+        return dict(self._data.get("packages", {}))
+
+    def clear_all_packages(self) -> None:
+        self._data.pop("packages", None)
+        self.save()
+
 
 # ── mission controller ────────────────────────────────────────────────────────
 
@@ -381,9 +401,95 @@ class MissionController:
             self._nav.set_motor_override(False)
             drive.stop_motors()
 
+    def _creep_to_package(self, duration_s: float = 1.0) -> None:
+        """Slow forward push after centering on the package — closes the remaining gap."""
+        drive = self._nav._drive
+        self._nav.set_motor_override(True)
+        try:
+            creep_speed = max(62, int(getattr(self._nav, "_drive_speed", 62)))
+            drive.move_forward(creep_speed)
+            time.sleep(duration_s)
+        finally:
+            self._nav.set_motor_override(False)
+            drive.stop_motors()
+
+    def _backup_after_grab(self, timeout_s: float = 5.0) -> None:
+        """Reverse after closing the claw to clear the pickup spot.
+
+        Default distance: half the arm length.
+        If the front is closer to the frame edge than the back, back up a full arm length.
+        If the back is already near the frame edge, skip the reverse.
+        """
+        st = getattr(self._nav, "state", None)
+        if not st or not st.bot_pos or st.bot_heading is None:
+            return
+
+        arm_px = float(getattr(self._nav, "_claw_center_offset_px", 0.0) or 0.0)
+        if arm_px <= 0:
+            arm_px = float(getattr(self._nav, "_claw_offset_px", 0) or 0)
+        if arm_px <= 0:
+            return
+
+        bx, by   = st.bot_pos
+        hdg      = float(st.bot_heading)
+        fw       = float(st.frame_w or 640)
+        fh       = float(st.frame_h or 480)
+        cos_h, sin_h = math.cos(hdg), math.sin(hdg)
+
+        def _ray_dist(dx, dy):
+            """Pixels until the ray (bx+t*dx, by+t*dy) hits a frame boundary."""
+            ts = []
+            if abs(dx) > 1e-6:
+                ts.append(((fw - bx) / dx) if dx > 0 else (bx / (-dx)))
+            if abs(dy) > 1e-6:
+                ts.append(((fh - by) / dy) if dy > 0 else (by / (-dy)))
+            return min(ts) if ts else float("inf")
+
+        front_dist = _ray_dist( cos_h,  sin_h)
+        back_dist  = _ray_dist(-cos_h, -sin_h)
+
+        _EDGE_MARGIN_PX = 70
+        if back_dist < _EDGE_MARGIN_PX:
+            return  # back already near frame edge — skip reverse
+
+        if front_dist < back_dist:
+            target_px = arm_px          # front near edge → back up full arm length
+        else:
+            target_px = arm_px * 0.5    # normal → back up half arm length
+
+        target_px = min(target_px, back_dist - _EDGE_MARGIN_PX)
+        if target_px <= 5:
+            return
+
+        start_x, start_y = st.bot_pos
+        drive = self._nav._drive
+        self._nav.set_motor_override(True)
+        try:
+            back_speed = max(50, min(70, int(getattr(self._nav, "_drive_speed", 60) * 0.85)))
+            drive.drive(-back_speed, -back_speed)
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                if self._aborted():
+                    break
+                cur = getattr(self._nav, "state", None)
+                if not cur or not cur.bot_pos:
+                    time.sleep(0.03)
+                    continue
+                dx = cur.bot_pos[0] - start_x
+                dy = cur.bot_pos[1] - start_y
+                backward_progress = -(dx * cos_h + dy * sin_h)
+                if backward_progress >= target_px:
+                    break
+                time.sleep(0.03)
+        finally:
+            self._nav.set_motor_override(False)
+            drive.stop_motors()
+
     def _run(self) -> None:
         try:
             self._abort.clear()
+            base_qr = self._reg.get("base")
+
             # 1. Open claw before package retrieval
             self._set_state("opening_claw")
             t = threading.Thread(target=self._claw_open, daemon=True)
@@ -395,15 +501,20 @@ class MissionController:
 
             # 2. Go to package
             self._set_state("going_to_package")
-            self._depart_base_forward()
             if not self._navigate_to(
-                self.package_qr, "package", claw_mode=True, allow_reverse=False, pickup_contact=True
+                self.package_qr, "package", claw_mode=True, allow_reverse=False, pickup_contact=True,
+                claw_adjust_px=35,
             ):
                 self._reset_context()
                 self._set_state("idle")
                 return
 
-            # 3. Close claw to grab the package, then leave immediately
+            # 3. Creep forward to seat the claw on the package, then close
+            self._creep_to_package()
+            if self._aborted():
+                self._reset_context()
+                self._set_state("idle")
+                return
             self._set_state("grabbing_package")
             t = threading.Thread(target=self._claw_close, kwargs={"settle_s": 0.8}, daemon=True)
             t.start(); t.join()
@@ -411,36 +522,12 @@ class MissionController:
                 self._reset_context()
                 self._set_state("idle")
                 return
+            self._backup_after_grab()
 
-            # 4. Return to base with the package
-            self._set_state("returning_to_base")
-            base_qr = self._reg.get("base")
-            if not base_qr or not self._navigate_to(base_qr, "base", force_reverse=True):
-                self._reset_context()
-                self._set_state("idle")
-                return
-
-            # 5. Wait for operator to select destination
-            self._set_state("awaiting_destination")
-            self._dest_set.clear()
-            deadline = time.monotonic() + 300.0
-            dest_ready = False
-            while time.monotonic() < deadline:
-                if self._aborted():
-                    break
-                if self._dest_set.wait(timeout=0.1):
-                    dest_ready = True
-                    break
-            if self._aborted() or not dest_ready or not self.destination:
-                self._reset_context()
-                self._set_state("idle")
-                return
-
-            # 6. Go to station — stop when claw tip reaches station QR, not bot QR
+            # 4. Go directly to station — no return to base
             self._set_state("going_to_station")
             dest_qr = self._reg.get(self.destination)
             drop_offset = self._reg.get_station_drop_offset(self.destination) if self.destination else None
-            self._clear_base_forward()
             if not dest_qr or not self._navigate_to(
                 dest_qr, self.destination, claw_mode=True, claw_adjust_px=0,
                 allow_reverse=False, target_offset=drop_offset
@@ -449,7 +536,7 @@ class MissionController:
                 self._set_state("idle")
                 return
 
-            # 7. Open claw to release at the station as soon as the claw reaches it
+            # 5. Open claw to release at the station
             self._set_state("dropping_off")
             t = threading.Thread(target=self._claw_open, kwargs={"settle_s": 1.5}, daemon=True)
             t.start(); t.join()
@@ -458,14 +545,14 @@ class MissionController:
                 self._set_state("idle")
                 return
 
-            # 8. Return to base with the claw still open
+            # 6. Return to base
             self._set_state("returning_to_base_after_drop")
             if not base_qr or not self._navigate_to(base_qr, "base", force_reverse=True):
                 self._reset_context()
                 self._set_state("idle")
                 return
 
-            # 9. Close claw once back at base
+            # 7. Close claw once back at base
             self._set_state("closing_claw")
             t = threading.Thread(target=self._claw_close, daemon=True)
             t.start(); t.join()
@@ -478,23 +565,16 @@ class MissionController:
             self._reset_context()
             self._set_state("idle")
 
-    def start(self, package_qr: str) -> bool:
+    def start(self, package_qr: str, destination: str) -> bool:
         if self.state != "idle":
+            return False
+        if destination not in ["station_1", "station_2", "station_3"]:
             return False
         self._abort.clear()
         self.package_qr  = package_qr
-        self.destination = None
+        self.destination = destination
         self._thread = threading.Thread(target=self._run, daemon=True, name="mission")
         self._thread.start()
-        return True
-
-    def set_destination(self, station_key: str) -> bool:
-        if self.state != "awaiting_destination":
-            return False
-        if station_key not in ["station_1", "station_2", "station_3"]:
-            return False
-        self.destination = station_key
-        self._dest_set.set()
         return True
 
     def abort(self) -> None:
@@ -534,6 +614,109 @@ class MissionController:
             self._emit()
 
 
+# ── auto mission controller ───────────────────────────────────────────────────
+
+class AutoMissionController:
+    """Autonomous loop: watches the frame for registered packages and dispatches
+    missions one at a time without human intervention.
+
+    States: idle → waiting_for_package → dispatching → (mission runs) → waiting_for_package …
+    """
+
+    def __init__(self, mission: MissionController, navigator: QRNavigator,
+                 registry: StationsRegistry):
+        self._mission   = mission
+        self._nav       = navigator
+        self._registry  = registry
+        self.state      = "idle"
+        self._running   = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._on_change = None
+
+    def set_on_change(self, cb) -> None:
+        self._on_change = cb
+
+    def _emit(self) -> None:
+        if self._on_change:
+            try:
+                self._on_change()
+            except Exception:
+                pass
+
+    def _set_state(self, s: str) -> None:
+        self.state = s
+        log.info("AutoMission: → %s", s)
+        self._emit()
+
+    def start(self) -> bool:
+        if self.state != "idle":
+            return False
+        self._running.set()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="auto-mission")
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self._running.clear()
+        # Let the current mission finish naturally; the loop will exit after it completes.
+
+    def _find_package(self):
+        """Return (package_qr, station_key) for the first registered package visible in frame."""
+        nav_state = getattr(self._nav, "state", None)
+        if not nav_state:
+            return None, None
+        reserved = self._registry.qr_set()  # station/base/bot QR values
+        for qr in (nav_state.all_qr_payloads or []):
+            if not qr or qr in reserved:
+                continue
+            station = self._registry.get_package_station(qr)
+            if station:
+                return qr, station
+        return None, None
+
+    def _loop(self) -> None:
+        try:
+            while self._running.is_set():
+                self._set_state("waiting_for_package")
+
+                # Wait until any ongoing mission finishes and mission controller is idle
+                while self._running.is_set() and self._mission.state != "idle":
+                    time.sleep(0.2)
+                if not self._running.is_set():
+                    break
+
+                # Scan for a registered package visible in frame
+                pkg_qr, station = None, None
+                while self._running.is_set() and pkg_qr is None:
+                    pkg_qr, station = self._find_package()
+                    if pkg_qr is None:
+                        time.sleep(0.3)
+
+                if not self._running.is_set():
+                    break
+
+                log.info("AutoMission: detected package '%s' → %s", pkg_qr, station)
+                self._set_state("dispatching")
+
+                ok = self._mission.start(pkg_qr, station)
+                if not ok:
+                    log.warning("AutoMission: failed to start mission (mission state=%s)", self._mission.state)
+                    time.sleep(1.0)
+                    continue
+
+                # Wait for mission to complete
+                while self._running.is_set() and self._mission.state != "idle":
+                    time.sleep(0.2)
+
+                # Auto-unregister the delivered package so it isn't re-dispatched
+                self._registry.unregister_package(pkg_qr)
+                log.info("AutoMission: package '%s' delivered and unregistered", pkg_qr)
+                self._emit()
+
+        finally:
+            self._set_state("idle")
+
+
 # ── FastAPI app + shared state ────────────────────────────────────────────────
 
 app = FastAPI(title="Bug Navigator")
@@ -541,6 +724,7 @@ app = FastAPI(title="Bug Navigator")
 _navigator: Optional[QRNavigator] = None
 _nav_thread: Optional[threading.Thread] = None
 _mission: Optional[MissionController] = None
+_auto_mission: Optional["AutoMissionController"] = None
 _registry: Optional[StationsRegistry] = None
 _ws_clients: Set[WebSocket] = set()
 _ws_lock     = asyncio.Lock()
@@ -564,6 +748,7 @@ def _make_payload() -> str:
     return json.dumps({
         "nav_status":     s.status if s else "idle",
         "mission_state":  _mission.state if _mission else "idle",
+        "auto_state":     _auto_mission.state if _auto_mission else "idle",
         "qr_payload":     s.qr_payload if s else None,
         "qr_area_pct":    round(s.qr_area_pct * 100, 1) if s and s.qr_area_pct else None,
         "frame_w":        s.frame_w if s else None,
@@ -575,6 +760,7 @@ def _make_payload() -> str:
         "claw_center_offset_px": _registry.get_claw_center_offset_px() if _registry else None,
         "stations":          _registry.all() if _registry else {},
         "station_drop_offsets": _registry.all_station_drop_offsets() if _registry else {},
+        "registered_packages": _registry.all_packages() if _registry else {},
         "test_target":       _test_target,
         "full_station_qrs":  list(s.full_station_qrs) if s else [],
     })
@@ -639,6 +825,8 @@ header h1{font-size:1.2rem;color:#a78bfa;margin-right:4px}
 .badge.dropping_off{background:#3a2600;color:#fb923c}
 .badge.returning_to_base_after_drop{background:#1e1040;color:#a78bfa}
 .badge.closing_claw{background:#3a2600;color:#fb923c}
+.badge.waiting_for_package{background:#1a2a00;color:#a3e635}
+.badge.dispatching{background:#0e3a4a;color:#38bdf8}
 .badge.searching{background:#0e3a4a;color:#38bdf8}
 .badge.centering{background:#3a2600;color:#fb923c}
 .badge.approaching{background:#0a2e0a;color:#4ade80}
@@ -742,6 +930,7 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
 
 <div class="tabs">
   <button class="tab-btn active" onclick="showTab('setup')">Setup</button>
+  <button class="tab-btn" onclick="showTab('auto')">Auto Mission</button>
   <button class="tab-btn" onclick="showTab('mission')">Mission Control</button>
   <button class="tab-btn" onclick="showTab('test')">Testing</button>
   <button class="tab-btn" onclick="showTab('manual')">Manual Drive</button>
@@ -859,6 +1048,44 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
 
 </div>
 
+<!-- ─── AUTO MISSION TAB ─────────────────────────────────────────────────── -->
+<div id="tab-auto" class="tab-pane">
+  <div style="display:grid;grid-template-columns:1fr 360px;gap:16px">
+    <div>
+      <div class="camera-main"><img src="/stream" alt="camera feed"></div>
+    </div>
+    <div class="ctrl-panel">
+
+      <!-- Auto mission control -->
+      <div class="section">
+        <h3>Auto Mission</h3>
+        <div class="stat-row" style="margin-bottom:8px">
+          <span class="stat-label">Status</span>
+          <span id="auto-state-badge" class="badge idle">idle</span>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button id="btn-auto-start" class="btn-primary" style="flex:1" onclick="autoStart()">▶ Start Auto</button>
+          <button id="btn-auto-stop"  class="btn-danger"  style="flex:1" onclick="autoStop()" disabled>■ Stop</button>
+        </div>
+      </div>
+
+      <!-- Package registration -->
+      <div class="section">
+        <h3>Register Packages</h3>
+        <p style="font-size:.78rem;color:#666;margin-bottom:8px">Scan packages below, assign each a destination station, then start Auto Mission.</p>
+        <div id="auto-detect-list"><span style="color:#555;font-size:.8rem">Scanning…</span></div>
+      </div>
+
+      <!-- Package queue -->
+      <div class="section">
+        <h3>Package Queue</h3>
+        <div id="auto-queue-list"><span style="color:#555;font-size:.8rem">No packages registered.</span></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
 <!-- ─── MISSION TAB ───────────────────────────────────────────────────────── -->
 <div id="tab-mission" class="tab-pane">
   <div class="mission-grid">
@@ -886,27 +1113,22 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
         <div class="flow-step" id="fs-idle">Idle</div>
         <div class="flow-step" id="fs-opening_claw">Open Claw</div>
         <div class="flow-step" id="fs-going_to_package">→ Package</div>
-        <div class="flow-step" id="fs-grabbing_package">Close Claw</div>
-        <div class="flow-step" id="fs-returning_to_base">→ Base</div>
-        <div class="flow-step" id="fs-awaiting_destination">Dest?</div>
+        <div class="flow-step" id="fs-grabbing_package">Grab</div>
         <div class="flow-step" id="fs-going_to_station">→ Station</div>
         <div class="flow-step" id="fs-dropping_off">Open Claw</div>
         <div class="flow-step" id="fs-returning_to_base_after_drop">→ Base</div>
         <div class="flow-step" id="fs-closing_claw">Close Claw</div>
       </div>
 
-      <!-- Detected packages -->
-      <div class="section">
-        <h3>Detected Packages</h3>
+      <!-- Mission setup: package + destination -->
+      <div class="section" id="mission-setup">
+        <h3>Package</h3>
         <div id="pkg-list"><span style="color:#555;font-size:.8rem">Scanning…</span></div>
-      </div>
-
-      <!-- Destination selector (shown only when awaiting) -->
-      <div class="section" id="dest-section" style="display:none">
-        <h3>Select Destination</h3>
-        <div class="dest-grid" id="dest-grid">
-          <!-- injected by JS -->
-        </div>
+        <h3 style="margin-top:10px">Destination</h3>
+        <div class="dest-grid" id="dest-grid"></div>
+        <button class="btn-primary" id="btn-start-mission" style="margin-top:10px;width:100%" disabled onclick="startMission()">
+          Start Mission
+        </button>
       </div>
 
       <!-- Claw controls -->
@@ -1142,15 +1364,18 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
 <script>
 const STATION_KEYS   = ['bot','base','station_1','station_2','station_3'];
 const STATION_LABELS = {bot:'Bot',base:'Base',station_1:'Station 1',station_2:'Station 2',station_3:'Station 3'};
-const FLOW_STATES    = ['idle','opening_claw','going_to_package','grabbing_package','returning_to_base',
-                        'awaiting_destination','going_to_station','dropping_off',
-                        'returning_to_base_after_drop','closing_claw'];
+const FLOW_STATES    = ['idle','opening_claw','going_to_package','grabbing_package',
+                        'going_to_station','dropping_off','returning_to_base_after_drop','closing_claw'];
 
 let stationsData   = {};
 let stationDropOffsets = {};
 let allQrPayloads  = [];
 let missionState   = 'idle';
+let autoState      = 'idle';
 let fullStationKeys = new Set();  // station keys (station_1 etc.) currently full
+let selectedPackage = null;
+let selectedStation = null;
+let registeredPackages = {};  // {qr: station_key}
 
 // ── tabs ──────────────────────────────────────────────────────────────────────
 function showTab(id) {
@@ -1197,8 +1422,13 @@ function renderPackages(qrs) {
   const pkgs = qrs.filter(q => q && !stationSet.has(q));
 
   if (!pkgs.length) {
+    if (selectedPackage) { selectedPackage = null; _updateStartBtn(); }
     box.innerHTML = '<span style="color:#555;font-size:.8rem">No packages in frame</span>';
     return;
+  }
+  // Deselect if previously selected package is no longer visible
+  if (selectedPackage && !pkgs.includes(selectedPackage)) {
+    selectedPackage = null; _updateStartBtn();
   }
   box.innerHTML = '';
   pkgs.forEach(qr => {
@@ -1208,10 +1438,11 @@ function renderPackages(qrs) {
     label.className = 'pkg-qr';
     label.textContent = qr;
     const btn = document.createElement('button');
-    btn.className = 'btn-primary btn-sm';
-    btn.textContent = 'Pick up';
+    const isSelected = (selectedPackage === qr);
+    btn.className = isSelected ? 'btn-success btn-sm' : 'btn-secondary btn-sm';
+    btn.textContent = isSelected ? '✓ Selected' : 'Select';
     btn.disabled = (missionState !== 'idle');
-    btn.onclick = () => startMission(qr);
+    btn.onclick = () => { selectedPackage = isSelected ? null : qr; renderPackages(allQrPayloads); _updateStartBtn(); };
     row.appendChild(label);
     row.appendChild(btn);
     box.appendChild(row);
@@ -1225,10 +1456,12 @@ function esc(s) {
 
 // ── full state update ─────────────────────────────────────────────────────────
 function applyState(s) {
-  stationsData  = s.stations || {};
+  stationsData       = s.stations || {};
   stationDropOffsets = s.station_drop_offsets || {};
-  allQrPayloads = s.all_qr_payloads || [];
-  missionState  = s.mission_state || 'idle';
+  allQrPayloads      = s.all_qr_payloads || [];
+  missionState       = s.mission_state || 'idle';
+  autoState          = s.auto_state   || 'idle';
+  registeredPackages = s.registered_packages || {};
   const clawCenterOffset = s.claw_center_offset_px;
 
   // Map full QR payloads → station keys
@@ -1258,11 +1491,22 @@ function applyState(s) {
   renderDestButtons();
 
   // Show/hide destination panel
-  document.getElementById('dest-section').style.display =
-    missionState === 'awaiting_destination' ? 'block' : 'none';
+  document.getElementById('mission-setup').style.display =
+    missionState === 'idle' ? 'block' : 'none';
+  _updateStartBtn();
 
   // Abort button
   document.getElementById('btn-abort').disabled = (missionState === 'idle');
+
+  // Auto mission tab
+  const ab = document.getElementById('auto-state-badge');
+  if (ab) { ab.textContent = autoState; ab.className = 'badge ' + autoState; }
+  const btnAs = document.getElementById('btn-auto-start');
+  const btnAx = document.getElementById('btn-auto-stop');
+  if (btnAs) btnAs.disabled = (autoState !== 'idle');
+  if (btnAx) btnAx.disabled = (autoState === 'idle');
+  renderAutoDetect(allQrPayloads);
+  renderAutoQueue();
 
   if (s.nxt_connected !== undefined) applyNxt(s.nxt_connected);
 
@@ -1556,37 +1800,44 @@ function renderDestButtons() {
   ['station_1','station_2','station_3'].forEach(key => {
     const registered = !!stationsData[key];
     const full = fullStationKeys.has(key);
+    const isSelected = (selectedStation === key);
     const btn  = document.createElement('button');
     if (!registered) {
       btn.className = 'btn-secondary';
       btn.textContent = STATION_LABELS[key] + ' (not set)';
+    } else if (isSelected) {
+      btn.className = 'btn-success';
+      btn.textContent = '✓ ' + STATION_LABELS[key];
     } else {
-      btn.className = full ? 'btn-danger' : 'btn-success';
+      btn.className = full ? 'btn-danger' : 'btn-neutral';
       btn.textContent = STATION_LABELS[key] + (full ? ' (FULL)' : '');
     }
-    btn.disabled = (missionState !== 'awaiting_destination') || full || !registered;
-    btn.onclick  = () => selectDest(key);
+    btn.disabled = (missionState !== 'idle') || !registered;
+    btn.onclick  = () => { selectedStation = isSelected ? null : key; renderDestButtons(); _updateStartBtn(); };
     grid.appendChild(btn);
   });
 }
 
-// ── mission actions ───────────────────────────────────────────────────────────
-async function startMission(packageQr) {
-  const r = await fetch('/api/mission/start', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({package_qr: packageQr})
-  });
-  const d = await r.json();
-  addLog(d.ok ? `Mission started → "${packageQr}"` : 'Start failed: ' + d.reason);
+function _updateStartBtn() {
+  const btn = document.getElementById('btn-start-mission');
+  if (!btn) return;
+  btn.disabled = (missionState !== 'idle') || !selectedPackage || !selectedStation;
 }
 
-async function selectDest(station) {
-  const r = await fetch('/api/mission/destination', {
+// ── mission actions ───────────────────────────────────────────────────────────
+async function startMission() {
+  if (!selectedPackage || !selectedStation) return;
+  const r = await fetch('/api/mission/start', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({station})
+    body: JSON.stringify({package_qr: selectedPackage, station: selectedStation})
   });
   const d = await r.json();
-  addLog(d.ok ? `Destination set: ${STATION_LABELS[station]}` : 'Error: ' + d.reason);
+  if (d.ok) {
+    addLog(`Mission started → "${selectedPackage}" → ${STATION_LABELS[selectedStation]}`);
+    selectedPackage = null; selectedStation = null;
+  } else {
+    addLog('Start failed: ' + d.reason);
+  }
 }
 
 async function abortMission() {
@@ -1599,6 +1850,96 @@ async function claw(action) {
   const r = await fetch('/api/claw/' + action, {method:'POST'});
   const d = await r.json();
   addLog(d.ok ? `Claw ${action}` : `Claw ${action} failed: ` + d.reason);
+}
+
+// ── auto mission ─────────────────────────────────────────────────────────────
+
+function renderAutoDetect(qrs) {
+  const box = document.getElementById('auto-detect-list');
+  if (!box) return;
+  const reserved = new Set(Object.values(stationsData).filter(Boolean));
+  const candidates = qrs.filter(q => q && !reserved.has(q) && !registeredPackages[q]);
+  if (!candidates.length) {
+    box.innerHTML = '<span style="color:#555;font-size:.8rem">No unregistered packages in frame.</span>';
+    return;
+  }
+  box.innerHTML = '';
+  candidates.forEach(qr => {
+    const row = document.createElement('div');
+    row.className = 'pkg-item';
+    const label = document.createElement('span');
+    label.className = 'pkg-qr';
+    label.textContent = qr;
+    const sel = document.createElement('select');
+    sel.style.cssText = 'background:#111;color:#e8e8e8;border:1px solid #333;border-radius:5px;padding:3px 6px;font-size:.8rem';
+    sel.innerHTML = '<option value="">Station…</option>' +
+      ['station_1','station_2','station_3'].map(k => {
+        const registered = !!stationsData[k];
+        return `<option value="${k}"${!registered?' disabled':''}>${STATION_LABELS[k]}${!registered?' (not set)':''}</option>`;
+      }).join('');
+    const btn = document.createElement('button');
+    btn.className = 'btn-primary btn-sm';
+    btn.textContent = 'Register';
+    btn.onclick = async () => {
+      if (!sel.value) return;
+      const r = await fetch('/api/packages/register', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({qr, station: sel.value})
+      });
+      const d = await r.json();
+      addLog(d.ok ? `Registered "${qr}" → ${STATION_LABELS[sel.value]}` : 'Error: ' + d.reason);
+    };
+    row.appendChild(label);
+    row.appendChild(sel);
+    row.appendChild(btn);
+    box.appendChild(row);
+  });
+}
+
+function renderAutoQueue() {
+  const box = document.getElementById('auto-queue-list');
+  if (!box) return;
+  const entries = Object.entries(registeredPackages);
+  if (!entries.length) {
+    box.innerHTML = '<span style="color:#555;font-size:.8rem">No packages registered.</span>';
+    return;
+  }
+  box.innerHTML = '';
+  entries.forEach(([qr, stationKey]) => {
+    const row = document.createElement('div');
+    row.className = 'pkg-item';
+    const label = document.createElement('span');
+    label.className = 'pkg-qr';
+    label.textContent = qr;
+    const dest = document.createElement('span');
+    dest.style.cssText = 'font-size:.78rem;color:#a78bfa;margin-left:4px';
+    dest.textContent = '→ ' + (STATION_LABELS[stationKey] || stationKey);
+    const btn = document.createElement('button');
+    btn.className = 'btn-danger btn-sm';
+    btn.textContent = 'Remove';
+    btn.onclick = async () => {
+      const r = await fetch('/api/packages/unregister', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({qr})
+      });
+      addLog((await r.json()).ok ? `Removed "${qr}"` : 'Remove failed');
+    };
+    row.appendChild(label);
+    row.appendChild(dest);
+    row.appendChild(btn);
+    box.appendChild(row);
+  });
+}
+
+async function autoStart() {
+  const r = await fetch('/api/auto/start', {method:'POST'});
+  const d = await r.json();
+  addLog(d.ok ? 'Auto mission started' : 'Start failed: ' + d.reason);
+}
+
+async function autoStop() {
+  const r = await fetch('/api/auto/stop', {method:'POST'});
+  addLog((await r.json()).ok ? 'Auto mission stopping…' : 'Stop failed');
 }
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -2516,31 +2857,80 @@ async def api_setup_clear(body: dict):
 @app.post("/api/mission/start")
 async def api_mission_start(body: dict):
     package_qr = body.get("package_qr", "").strip()
+    station    = body.get("station", "").strip()
     if not package_qr:
         return {"ok": False, "reason": "package_qr required"}
+    if not station:
+        return {"ok": False, "reason": "station required"}
     if not _registry.get("base"):
         return {"ok": False, "reason": "base QR not registered"}
     if _registry and not _registry.is_package_qr(package_qr):
         return {"ok": False, "reason": f'"{package_qr}" is registered as a station/base, not a package'}
-    log.info("Mission start requested for package_qr=%s", package_qr)
-    ok = _mission.start(package_qr)
+    if not _registry.get(station):
+        return {"ok": False, "reason": f'station "{station}" not registered'}
+    log.info("Mission start: package_qr=%s destination=%s", package_qr, station)
+    ok = _mission.start(package_qr, station)
     if ok:
         asyncio.create_task(_broadcast_state())
     return {"ok": ok, "reason": "" if ok else "mission already running"}
 
 
-@app.post("/api/mission/destination")
-async def api_mission_destination(body: dict):
-    station = body.get("station", "")
-    ok = _mission.set_destination(station)
-    if ok:
-        asyncio.create_task(_broadcast_state())
-    return {"ok": ok, "reason": "" if ok else "not awaiting destination"}
-
-
 @app.post("/api/mission/abort")
 async def api_mission_abort():
     _mission.abort()
+    asyncio.create_task(_broadcast_state())
+    return {"ok": True}
+
+
+# ── package queue routes ──────────────────────────────────────────────────────
+
+@app.get("/api/packages")
+async def api_packages_list():
+    return {"packages": _registry.all_packages() if _registry else {}}
+
+@app.post("/api/packages/register")
+async def api_packages_register(body: dict):
+    qr      = body.get("qr", "").strip()
+    station = body.get("station", "").strip()
+    if not qr:
+        return {"ok": False, "reason": "qr required"}
+    if station not in ("station_1", "station_2", "station_3"):
+        return {"ok": False, "reason": "invalid station"}
+    if not _registry.get(station):
+        return {"ok": False, "reason": f'station "{station}" not registered'}
+    if _registry.qr_set() and qr in _registry.qr_set():
+        return {"ok": False, "reason": "QR is already registered as a station or base"}
+    _registry.register_package(qr, station)
+    log.info("Package registered: %s → %s", qr, station)
+    asyncio.create_task(_broadcast_state())
+    return {"ok": True}
+
+@app.post("/api/packages/unregister")
+async def api_packages_unregister(body: dict):
+    qr = body.get("qr", "").strip()
+    if not qr:
+        return {"ok": False, "reason": "qr required"}
+    _registry.unregister_package(qr)
+    asyncio.create_task(_broadcast_state())
+    return {"ok": True}
+
+
+# ── auto mission routes ───────────────────────────────────────────────────────
+
+@app.post("/api/auto/start")
+async def api_auto_start():
+    if not _auto_mission:
+        return {"ok": False, "reason": "auto mission not initialized"}
+    if not _registry.get("base"):
+        return {"ok": False, "reason": "base QR not registered"}
+    ok = _auto_mission.start()
+    asyncio.create_task(_broadcast_state())
+    return {"ok": ok, "reason": "" if ok else "already running"}
+
+@app.post("/api/auto/stop")
+async def api_auto_stop():
+    if _auto_mission:
+        _auto_mission.stop()
     asyncio.create_task(_broadcast_state())
     return {"ok": True}
 
@@ -3218,7 +3608,7 @@ def _apply_station_qrs() -> None:
 
 @app.on_event("startup")
 async def _startup():
-    global _loop, _navigator, _nav_thread, _mission, _registry, _app_config
+    global _loop, _navigator, _nav_thread, _mission, _auto_mission, _registry, _app_config
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -3236,6 +3626,11 @@ async def _startup():
 
     _mission   = MissionController(_navigator, _registry)
     _mission.set_on_change(
+        lambda: asyncio.run_coroutine_threadsafe(_broadcast_state(), _loop)
+    )
+
+    _auto_mission = AutoMissionController(_mission, _navigator, _registry)
+    _auto_mission.set_on_change(
         lambda: asyncio.run_coroutine_threadsafe(_broadcast_state(), _loop)
     )
 

@@ -33,8 +33,8 @@ DEFAULT_ARRIVED_DIST_PX  = 80     # overhead mode: pixels bot→target = arrived
 DEFAULT_BASE_PARK_ARRIVED_DIST_PX = 28  # tighter stop when parking bot QR onto saved base slot
 DEFAULT_CLAW_CENTER_CM = 10.0     # fallback guess when claw centre has not been image-calibrated
 DEFAULT_CLAW_CENTER_ARRIVED_DIST_PX = 18  # calibrated claw centre may come this close to target before stopping
-DEFAULT_PICKUP_CONTACT_MIN_PX = 24
-DEFAULT_PICKUP_CONTACT_RATIO = 0.35
+DEFAULT_PICKUP_CONTACT_MIN_PX = 50
+DEFAULT_PICKUP_CONTACT_RATIO = 0.65
 
 _REPULSE_RADIUS_PX   = 150   # px from obstacle centre where repulsion starts
 _OCCLUDE_FULL_FRAMES  = 45   # consecutive missing frames → station "full"  (~1.8 s at 25 fps)
@@ -882,7 +882,7 @@ class QRNavigator:
             claw_y = bot_aruco["cy"] + claw_center_px * math.sin(bot_hdg)
 
         if target is None:
-            _CLAW_COAST_S = 2.0   # seconds to drive blind after station QR is occluded
+            _CLAW_COAST_S = 1.0   # seconds to drive blind after station QR is occluded
             in_claw_delivery = self._use_claw_arrived and (has_calibrated_claw_center or self._claw_offset_px > 0)
             time_since_target = time.time() - self._last_target_seen_t
             last_tx, last_ty = self._last_target_pos if self._last_target_pos else (claw_x, claw_y)
@@ -890,7 +890,8 @@ class QRNavigator:
             if in_claw_delivery and self._last_target_seen_t > 0:
                 if time_since_target <= _CLAW_COAST_S:
                     # Station QR likely occluded by the package — keep driving forward
-                    self._drive.drive(self._drive_speed, self._drive_speed)
+                    coast_speed = max(62, self._drive_speed)
+                    self._drive.drive(coast_speed, coast_speed)
                     self._set_state(
                         status="approaching",
                         qr_payload=self._target_qr, qr_cx=int(bx), qr_area_pct=None,
@@ -963,13 +964,39 @@ class QRNavigator:
         self._last_target_pos = (eff_tx, eff_ty)
         self._last_target_metric = distance_metric
         self._last_target_seen_t = time.time()
-        pickup_contact = (
+        # ── heading error (computed before arrived check for centering logic) ──────
+        front_only_target = (not self._allow_reverse) and (not is_base_parking)
+        align_x, align_y = bx, by
+        if front_only_target and bot_aruco is not None:
+            align_x, align_y = bot_aruco["cx"], bot_aruco["cy"]
+        is_station_target = (
+            self._target_qr is not None
+            and self._target_qr in self._station_qrs
+            and self._target_qr != self._base_qr
+        )
+        if front_only_target and is_station_target:
+            desired = _heading_from_points(align_x, align_y, eff_tx, eff_ty, 0.0)
+        else:
+            desired = _avoidance_heading(align_x, align_y, eff_tx, eff_ty, qr_items,
+                                         exclude={self._bot_qr, self._target_qr})
+        err         = _angle_diff(desired, bot_hdg)
+        reverse_err = _angle_diff(desired, bot_hdg + math.pi)
+        rel_dx, rel_dy = eff_tx - align_x, eff_ty - align_y
+        forward_proj = math.cos(bot_hdg) * rel_dx + math.sin(bot_hdg) * rel_dy
+
+        # ── arrived check ────────────────────────────────────────────────────────
+        _PICKUP_CENTER_TOL = math.radians(12)   # must be this aligned before grabbing
+        in_package_pickup  = (
             self._pickup_contact_arrived
             and self._use_claw_arrived
             and not is_base_parking
+        )
+        pickup_contact = (
+            in_package_pickup
             and claw_distance <= max(DEFAULT_PICKUP_CONTACT_MIN_PX, target_size_px * DEFAULT_PICKUP_CONTACT_RATIO)
         )
-        if pickup_contact or distance_metric < arrived_threshold:
+        if pickup_contact:
+            # Hard contact — too close, grab now regardless of centering
             self._drive.stop_motors()
             self._set_state(
                 status="arrived",
@@ -980,37 +1007,26 @@ class QRNavigator:
                 target_pos=(eff_tx, eff_ty), dist_to_target=distance_metric, heading_error=0.0,
                 parking_target_pos=park_pos, full_station_qrs=full_list,
             )
-            if pickup_contact:
-                log.info("Navigator (overhead): pickup contact at '%s' claw_dist=%.1fpx qr_size=%.1fpx",
-                         self._target_qr, claw_distance, target_size_px)
-            else:
+            log.info("Navigator (overhead): pickup contact at '%s' claw_dist=%.1fpx qr_size=%.1fpx",
+                     self._target_qr, claw_distance, target_size_px)
+            return
+        elif distance_metric < arrived_threshold:
+            if not in_package_pickup or abs(err) < _PICKUP_CENTER_TOL:
+                # Station/base arrived, or package pickup with claw centered
+                self._drive.stop_motors()
+                self._set_state(
+                    status="arrived",
+                    qr_payload=self._target_qr, qr_cx=int(bx), qr_area_pct=1.0,
+                    frame_w=fw, frame_h=fh,
+                    all_qr_payloads=all_payloads, all_qr_rects=all_rects,
+                    bot_pos=(bx, by), bot_heading=bot_hdg,
+                    target_pos=(eff_tx, eff_ty), dist_to_target=distance_metric, heading_error=0.0,
+                    parking_target_pos=park_pos, full_station_qrs=full_list,
+                )
                 log.info("Navigator (overhead): arrived at '%s' dist=%.1fpx",
                          self._target_qr, distance_metric)
-            return
-
-        front_only_target = (not self._allow_reverse) and (not is_base_parking)
-        align_x, align_y = bx, by
-        if front_only_target and bot_aruco is not None:
-            # For station/package runs, align the front axis defined by QR -> ArUco.
-            align_x, align_y = bot_aruco["cx"], bot_aruco["cy"]
-        is_station_target = (
-            self._target_qr is not None
-            and self._target_qr in self._station_qrs
-            and self._target_qr != self._base_qr
-        )
-        if front_only_target and is_station_target:
-            # Stations are clustered together, so treating neighboring station QRs as
-            # repellers can bend the approach around the strip and make the robot
-            # appear to "prefer" its back side. For delivery, point the claw axis
-            # straight at the selected station instead.
-            desired = _heading_from_points(align_x, align_y, eff_tx, eff_ty, 0.0)
-        else:
-            desired = _avoidance_heading(align_x, align_y, eff_tx, eff_ty, qr_items,
-                                         exclude={self._bot_qr, self._target_qr})
-        err     = _angle_diff(desired, bot_hdg)
-        reverse_err = _angle_diff(desired, bot_hdg + math.pi)
-        rel_dx, rel_dy = eff_tx - align_x, eff_ty - align_y
-        forward_proj = math.cos(bot_hdg) * rel_dx + math.sin(bot_hdg) * rel_dy
+                return
+            # else: within grab radius but claw not yet centered — fall through to fine steer
         side_err = math.cos(bot_hdg) * rel_dy - math.sin(bot_hdg) * rel_dx
         forward_turn_err = err
         if front_only_target and abs(side_err) > 1e-6:
