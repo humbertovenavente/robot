@@ -661,17 +661,31 @@ class AutoMissionController:
         # Let the current mission finish naturally; the loop will exit after it completes.
 
     def _find_package(self):
-        """Return (package_qr, station_key) for the first registered package visible in frame."""
+        """Return (package_qr, station_key) for the first registered package visible in frame
+        whose destination station is not currently full."""
         nav_state = getattr(self._nav, "state", None)
         if not nav_state:
             return None, None
+
+        # Build the set of currently-full station keys
+        full_qrs = set(getattr(nav_state, "full_station_qrs", None) or [])
+        full_stations = {
+            key for key in ("station_1", "station_2", "station_3")
+            if (qr := self._registry.get(key)) and qr in full_qrs
+        }
+
         reserved = self._registry.qr_set()  # station/base/bot QR values
-        for qr in (nav_state.all_qr_payloads or []):
+        visible = list(nav_state.all_qr_payloads or [])
+        for qr in visible:
             if not qr or qr in reserved:
                 continue
             station = self._registry.get_package_station(qr)
-            if station:
-                return qr, station
+            if not station:
+                continue
+            if station in full_stations:
+                log.debug("AutoMission: skipping '%s' → %s (station full)", qr, station)
+                continue
+            return qr, station
         return None, None
 
     def _loop(self) -> None:
@@ -708,10 +722,7 @@ class AutoMissionController:
                 while self._running.is_set() and self._mission.state != "idle":
                     time.sleep(0.2)
 
-                # Auto-unregister the delivered package so it isn't re-dispatched
-                self._registry.unregister_package(pkg_qr)
-                log.info("AutoMission: package '%s' delivered and unregistered", pkg_qr)
-                self._emit()
+                log.info("AutoMission: package '%s' delivered", pkg_qr)
 
         finally:
             self._set_state("idle")
@@ -1067,6 +1078,9 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
           <button id="btn-auto-start" class="btn-primary" style="flex:1" onclick="autoStart()">▶ Start Auto</button>
           <button id="btn-auto-stop"  class="btn-danger"  style="flex:1" onclick="autoStop()" disabled>■ Stop</button>
         </div>
+        <div style="margin-top:6px">
+          <button id="btn-auto-abort" class="btn-danger" style="width:100%" onclick="autoAbort()">⚠ Emergency Stop</button>
+        </div>
       </div>
 
       <!-- Package registration -->
@@ -1080,6 +1094,12 @@ footer{text-align:center;padding:10px;color:#333;font-size:.72rem}
       <div class="section">
         <h3>Package Queue</h3>
         <div id="auto-queue-list"><span style="color:#555;font-size:.8rem">No packages registered.</span></div>
+      </div>
+
+      <!-- Auto log -->
+      <div class="section">
+        <h3>Log</h3>
+        <div id="auto-log-box"></div>
       </div>
 
     </div>
@@ -1394,6 +1414,15 @@ function addLog(msg) {
   if (box.children.length > 80) box.lastChild.remove();
 }
 
+function addAutoLog(msg) {
+  const box = document.getElementById('auto-log-box');
+  if (!box) { addLog(msg); return; }
+  const line = document.createElement('div');
+  line.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  box.prepend(line);
+  if (box.children.length > 40) box.lastChild.remove();
+}
+
 // ── NXT badge ─────────────────────────────────────────────────────────────────
 function applyNxt(ok) {
   const b = document.getElementById('nxt-badge');
@@ -1418,6 +1447,7 @@ function applyFlow(ms) {
 // ── package list ──────────────────────────────────────────────────────────────
 function renderPackages(qrs) {
   const box = document.getElementById('pkg-list');
+  if (box.contains(document.activeElement)) return;
   const stationSet = new Set(Object.values(stationsData).filter(Boolean));
   const pkgs = qrs.filter(q => q && !stationSet.has(q));
 
@@ -1796,6 +1826,7 @@ document.addEventListener('DOMContentLoaded', () => {
 function renderDestButtons() {
   const grid = document.getElementById('dest-grid');
   if (!grid) return;
+  if (grid.contains(document.activeElement)) return;
   grid.innerHTML = '';
   ['station_1','station_2','station_3'].forEach(key => {
     const registered = !!stationsData[key];
@@ -1857,6 +1888,7 @@ async function claw(action) {
 function renderAutoDetect(qrs) {
   const box = document.getElementById('auto-detect-list');
   if (!box) return;
+  if (box.contains(document.activeElement)) return;
   const reserved = new Set(Object.values(stationsData).filter(Boolean));
   const candidates = qrs.filter(q => q && !reserved.has(q) && !registeredPackages[q]);
   if (!candidates.length) {
@@ -1887,7 +1919,7 @@ function renderAutoDetect(qrs) {
         body: JSON.stringify({qr, station: sel.value})
       });
       const d = await r.json();
-      addLog(d.ok ? `Registered "${qr}" → ${STATION_LABELS[sel.value]}` : 'Error: ' + d.reason);
+      addAutoLog(d.ok ? `Registered "${qr}" → ${STATION_LABELS[sel.value]}` : 'Error: ' + d.reason);
     };
     row.appendChild(label);
     row.appendChild(sel);
@@ -1922,7 +1954,7 @@ function renderAutoQueue() {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({qr})
       });
-      addLog((await r.json()).ok ? `Removed "${qr}"` : 'Remove failed');
+      addAutoLog((await r.json()).ok ? `Removed "${qr}"` : 'Remove failed');
     };
     row.appendChild(label);
     row.appendChild(dest);
@@ -1934,12 +1966,17 @@ function renderAutoQueue() {
 async function autoStart() {
   const r = await fetch('/api/auto/start', {method:'POST'});
   const d = await r.json();
-  addLog(d.ok ? 'Auto mission started' : 'Start failed: ' + d.reason);
+  addAutoLog(d.ok ? 'Auto mission started' : 'Start failed: ' + d.reason);
 }
 
 async function autoStop() {
   const r = await fetch('/api/auto/stop', {method:'POST'});
-  addLog((await r.json()).ok ? 'Auto mission stopping…' : 'Stop failed');
+  addAutoLog((await r.json()).ok ? 'Auto mission stopping…' : 'Stop failed');
+}
+
+async function autoAbort() {
+  const r = await fetch('/api/auto/abort', {method:'POST'});
+  addAutoLog((await r.json()).ok ? 'Emergency stop sent' : 'Abort failed');
 }
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -2782,6 +2819,8 @@ async def api_status():
         "stations":        _registry.all() if _registry else {},
         "station_drop_offsets": _registry.all_station_drop_offsets() if _registry else {},
         "full_station_qrs": list(s.full_station_qrs) if s else [],
+        "auto_state":      _auto_mission.state if _auto_mission else "idle",
+        "registered_packages": _registry.all_packages() if _registry else {},
     }
 
 
@@ -2931,6 +2970,16 @@ async def api_auto_start():
 async def api_auto_stop():
     if _auto_mission:
         _auto_mission.stop()
+    asyncio.create_task(_broadcast_state())
+    return {"ok": True}
+
+
+@app.post("/api/auto/abort")
+async def api_auto_abort():
+    if _auto_mission:
+        _auto_mission.stop()
+    if _mission:
+        _mission.abort()
     asyncio.create_task(_broadcast_state())
     return {"ok": True}
 
@@ -3535,6 +3584,8 @@ async def api_camera_switch(body: dict):
 
     if _mission:
         _mission._nav = _navigator
+    if _auto_mission:
+        _auto_mission._nav = _navigator
     _nav_thread = threading.Thread(target=_navigator.run, daemon=True, name="navigator")
     _nav_thread.start()
     log.info("Camera switched to index %d", idx)
